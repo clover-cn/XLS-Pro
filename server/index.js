@@ -331,7 +331,7 @@ function setTaskState(task, state, message, extra = {}) {
   task.updatedAt = new Date().toISOString();
   if (message) task.message = message;
   Object.assign(task, extra);
-  publish(task, 'state', { state, message, task: publicTask(task) });
+  publish(task, 'state', { state, message, questions: task.questions || [], task: publicTask(task) });
 }
 
 function publicTask(task) {

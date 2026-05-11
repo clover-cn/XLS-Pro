@@ -57,11 +57,8 @@
             <h2>{{ statusLabel }}</h2>
           </div>
           <div class="status-actions">
-            <a v-if="task?.outputReady" class="download-link" :href="`/api/tasks/${task.id}/output`">下载结果</a>
+            <a v-if="task?.outputReady" class="download-link" :href="downloadUrl">下载结果</a>
             <a v-if="task" class="download-link" :href="`/api/tasks/${task.id}/logs`" target="_blank" rel="noreferrer">查看日志</a>
-            <button type="button" :disabled="!task?.generatedCode" @click="showCode = !showCode">
-              {{ showCode ? '隐藏代码' : '查看代码' }}
-            </button>
           </div>
         </header>
 
@@ -71,6 +68,55 @@
         </section>
 
         <template v-else>
+          <section class="console-grid">
+            <article class="panel log-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>实时日志</h3>
+                  <p class="muted">任务日志会自动刷新，包含模型生成、沙盒执行和错误信息。</p>
+                </div>
+                <button type="button" @click="fetchTaskLogs">刷新</button>
+              </div>
+              <pre class="log-output">{{ logText || compactEventsLog }}</pre>
+            </article>
+
+            <article class="panel execution-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>Python 执行窗口</h3>
+                  <p class="muted">{{ executionMessage }}</p>
+                </div>
+                <span class="status-pill" :class="`state-${task.state}`">{{ statusLabel }}</span>
+              </div>
+
+              <div class="execution-summary">
+                <div>
+                  <span>代码</span>
+                  <strong>{{ task.generatedCode ? `${task.generatedCode.length} 字符` : '等待生成' }}</strong>
+                </div>
+                <div>
+                  <span>结果</span>
+                  <strong>{{ task.outputReady ? '已生成' : '未生成' }}</strong>
+                </div>
+                <div>
+                  <span>更新时间</span>
+                  <strong>{{ formatTime(task.updatedAt) }}</strong>
+                </div>
+              </div>
+
+              <div v-if="task.state === 'failed'" class="error-box">
+                {{ task.message }}
+              </div>
+
+              <div v-if="task.outputReady" class="success-box">
+                结果文件已生成，可以下载。
+                <a class="download-link" :href="downloadUrl">下载结果</a>
+              </div>
+
+              <pre class="code-window">{{ task.generatedCode || '模型生成 Python 代码后会显示在这里。' }}</pre>
+            </article>
+          </section>
+
           <section class="grid">
             <article class="panel">
               <h3>文件元数据</h3>
@@ -149,28 +195,27 @@
               <li v-for="(event, index) in events" :key="`${event.at}-${index}`">
                 <span>{{ formatTime(event.at) }}</span>
                 <strong>{{ event.state || event.type }}</strong>
-                <p>{{ event.message || event.answer || event.code || event.error || '已更新' }}</p>
+                <p>{{ eventText(event) }}</p>
               </li>
             </ol>
-          </section>
-
-          <section v-if="showCode" class="code-panel">
-            <h3>生成的 Python 代码</h3>
-            <pre>{{ task.generatedCode || '代码生成后会显示在这里。' }}</pre>
           </section>
         </template>
       </section>
     </section>
 
-    <div v-if="task?.state === 'needs_clarification'" class="dialog-backdrop">
+    <div v-if="task?.state === 'needs_clarification' && !clarificationDismissed" class="dialog-backdrop">
       <section class="dialog">
         <h2>需要人工确认</h2>
-        <ul>
-          <li v-for="question in currentQuestions" :key="question">{{ question }}</li>
+        <p class="muted">Agent 需要你补充以下信息后才会继续生成代码。</p>
+        <ul v-if="clarificationQuestions.length">
+          <li v-for="question in clarificationQuestions" :key="question">{{ question }}</li>
         </ul>
-        <textarea v-model="clarificationAnswer" name="clarificationAnswer" rows="5" placeholder="请逐条回答 Agent 的问题。"></textarea>
+        <div v-else class="error-box">
+          未收到具体问题。请查看实时日志，或取消后重新创建任务。
+        </div>
+        <textarea v-model="clarificationAnswer" name="clarificationAnswer" rows="5" placeholder="请逐条回答上面的问题。"></textarea>
         <div class="dialog-actions">
-          <button type="button" @click="clarificationAnswer = ''">清空</button>
+          <button type="button" @click="cancelClarification">取消</button>
           <button class="primary-button" type="button" :disabled="!clarificationAnswer.trim()" @click="submitClarification">
             提交并继续
           </button>
@@ -181,7 +226,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 type ColumnSummary = {
   name: string;
@@ -232,6 +277,7 @@ type AgentEvent = {
   at: string;
   state?: string;
   message?: string;
+  questions?: string[];
   answer?: string;
   code?: string;
   error?: string;
@@ -246,10 +292,13 @@ const clarificationAnswer = ref('');
 const rules = ref<KnowledgeRule[]>([]);
 const task = ref<Task | null>(null);
 const events = ref<AgentEvent[]>([]);
+const logText = ref('');
 const isSubmitting = ref(false);
-const showCode = ref(false);
 const eventSource = ref<EventSource | null>(null);
 const currentQuestions = ref<string[]>([]);
+const clarificationDismissed = ref(false);
+const taskPollingTimer = ref<number | null>(null);
+const logPollingTimer = ref<number | null>(null);
 
 const statusText: Record<string, string> = {
   uploaded: '文件已上传',
@@ -266,6 +315,30 @@ const statusText: Record<string, string> = {
 const statusLabel = computed(() => {
   if (!task.value) return '等待创建任务';
   return statusText[task.value.state] || task.value.message || task.value.state;
+});
+
+const downloadUrl = computed(() => (task.value ? `/api/tasks/${task.value.id}/output` : '#'));
+
+const terminalStates = new Set(['completed', 'failed', 'needs_clarification']);
+
+const executionMessage = computed(() => {
+  if (!task.value) return '等待创建任务';
+  if (task.value.state === 'generating_code') return '模型正在生成可执行 Python 代码。';
+  if (task.value.state === 'executing') return '沙盒正在运行生成的 Python 脚本。';
+  if (task.value.state === 'repairing') return '脚本执行失败，模型正在自修复并重试。';
+  if (task.value.state === 'completed') return '沙盒执行完成，结果文件已就绪。';
+  if (task.value.state === 'failed') return '任务失败，请查看日志和错误信息。';
+  return task.value.message || '任务处理中';
+});
+
+const compactEventsLog = computed(() => events.value
+  .map((event) => `[${formatTime(event.at)}] ${event.state || event.type} ${eventText(event)}`)
+  .join('\n'));
+
+const clarificationQuestions = computed(() => {
+  const fromTask = task.value?.questions || [];
+  if (fromTask.length) return fromTask;
+  return currentQuestions.value;
 });
 
 const rawColumnIndexes = computed(() => {
@@ -292,6 +365,38 @@ async function refreshTask(id: string) {
   const response = await fetch(`/api/tasks/${id}`);
   if (response.ok) {
     task.value = await response.json();
+    if (task.value?.questions?.length) {
+      currentQuestions.value = task.value.questions;
+    }
+    if (task.value && terminalStates.has(task.value.state)) {
+      stopPolling();
+      fetchTaskLogs();
+    }
+  }
+}
+
+async function fetchTaskLogs() {
+  if (!task.value) return;
+  const response = await fetch(`/api/tasks/${task.value.id}/logs`);
+  if (response.ok) {
+    logText.value = await response.text();
+  }
+}
+
+function startPolling(id: string) {
+  stopPolling();
+  taskPollingTimer.value = window.setInterval(() => refreshTask(id), 2000);
+  logPollingTimer.value = window.setInterval(fetchTaskLogs, 2000);
+}
+
+function stopPolling() {
+  if (taskPollingTimer.value) {
+    window.clearInterval(taskPollingTimer.value);
+    taskPollingTimer.value = null;
+  }
+  if (logPollingTimer.value) {
+    window.clearInterval(logPollingTimer.value);
+    logPollingTimer.value = null;
   }
 }
 
@@ -305,36 +410,45 @@ function connectEvents(id: string) {
     const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
     events.value.unshift({ ...event, message: '事件流已连接' });
     if (event.task) task.value = event.task;
+    const questions = event.questions || event.task?.questions || [];
+    if (questions.length) currentQuestions.value = questions;
+    fetchTaskLogs();
   });
 
   source.addEventListener('state', (message) => {
     const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
     events.value.unshift(event);
     if (event.task) task.value = event.task;
-    if (event.task?.questions) currentQuestions.value = event.task.questions;
+    if (event.task?.questions?.length) currentQuestions.value = event.task.questions;
+    if (event.state !== 'needs_clarification') clarificationDismissed.value = false;
     if (event.state === 'completed' || event.state === 'failed') {
       refreshTask(id);
     }
+    fetchTaskLogs();
   });
 
   source.addEventListener('code', (message) => {
     const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
     events.value.unshift({ ...event, code: 'Python 代码已生成' });
     if (task.value) task.value.generatedCode = event.code || task.value.generatedCode;
+    fetchTaskLogs();
   });
 
   source.addEventListener('warning', (message) => {
     events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
+    fetchTaskLogs();
   });
 
   source.addEventListener('error', (message) => {
     if ((message as MessageEvent).data) {
       events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
     }
+    fetchTaskLogs();
   });
 
   source.addEventListener('clarification', (message) => {
     events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
+    fetchTaskLogs();
   });
 }
 
@@ -354,7 +468,11 @@ async function createTask() {
     }
     task.value = await response.json();
     currentQuestions.value = [];
+    clarificationDismissed.value = false;
+    logText.value = '';
     connectEvents(task.value.id);
+    startPolling(task.value.id);
+    fetchTaskLogs();
   } catch (error) {
     alert(error instanceof Error ? error.message : '任务创建失败');
   } finally {
@@ -373,7 +491,15 @@ async function submitClarification() {
     task.value = await response.json();
     clarificationAnswer.value = '';
     currentQuestions.value = [];
+    clarificationDismissed.value = false;
+    startPolling(task.value.id);
+    fetchTaskLogs();
   }
+}
+
+function cancelClarification() {
+  clarificationDismissed.value = true;
+  clarificationAnswer.value = '';
 }
 
 function formatTime(value: string) {
@@ -384,7 +510,19 @@ function formatTime(value: string) {
   }).format(new Date(value));
 }
 
+function eventText(event: AgentEvent) {
+  const questions = event.task?.questions || [];
+  if (event.questions?.length) return `${event.message || '需要人工确认'}：${event.questions.join('；')}`;
+  if (questions.length) return `${event.message || '需要人工确认'}：${questions.join('；')}`;
+  return event.message || event.answer || event.code || event.error || '已更新';
+}
+
 onMounted(loadRules);
+
+onUnmounted(() => {
+  eventSource.value?.close();
+  stopPolling();
+});
 </script>
 
 <style>
@@ -593,6 +731,134 @@ button:disabled {
   gap: 18px;
 }
 
+.console-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-header p {
+  margin: 4px 0 0;
+}
+
+.log-panel,
+.execution-panel {
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+.log-output,
+.code-window {
+  flex: 1;
+  margin: 0;
+  overflow: auto;
+  border-radius: 6px;
+  padding: 14px;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-output {
+  background: #101815;
+  color: #d7efe5;
+  min-height: 320px;
+}
+
+.code-window {
+  background: #17211d;
+  color: #e6f3ed;
+  min-height: 260px;
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 800;
+  background: #eef2ec;
+  color: #405149;
+  white-space: nowrap;
+}
+
+.state-executing,
+.state-generating_code,
+.state-repairing {
+  background: #fff2c9;
+  color: #7a5700;
+}
+
+.state-completed {
+  background: #dff4e9;
+  color: #116442;
+}
+
+.state-failed {
+  background: #ffe1df;
+  color: #9b241a;
+}
+
+.execution-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.execution-summary div {
+  border: 1px solid #dce4da;
+  border-radius: 6px;
+  padding: 10px;
+  background: #fbfcfa;
+}
+
+.execution-summary span {
+  display: block;
+  color: #607067;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.execution-summary strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.error-box,
+.success-box {
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+.error-box {
+  border: 1px solid #f3b0aa;
+  background: #fff1ef;
+  color: #8c231a;
+}
+
+.success-box {
+  border: 1px solid #b4dcc8;
+  background: #edf8f2;
+  color: #195b3f;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .meta-list {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -722,7 +988,8 @@ th {
 
 @media (max-width: 980px) {
   .workspace,
-  .grid {
+  .grid,
+  .console-grid {
     grid-template-columns: 1fr;
   }
 
