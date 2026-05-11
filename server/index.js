@@ -372,13 +372,48 @@ function needsClarification(task) {
 
 function isSuspiciousGeneratedCode(code) {
   const patterns = [
-    /INPUT_FILE\s*=\s*['"][^'"]+['"]/,
-    /OUTPUT_FILE\s*=\s*['"][^'"]+['"]/,
+    /(?:^|\n)\s*INPUT_FILE\s*=/,
+    /(?:^|\n)\s*OUTPUT_FILE\s*=/,
     /import\s+os\b/,
+    /import\s+sys\b/,
+    /import\s+pathlib\b/,
+    /import\s+subprocess\b/,
+    /import\s+requests\b/,
+    /from\s+(?:os|sys|pathlib|subprocess|requests)\b/,
     /\bglobals\s*\(/,
+    /\blocals\s*\(/,
+    /\bopen\s*\(/,
     /Alice|Bob|Charlie|dummy|示例文件|example input/i,
   ];
   return patterns.some((pattern) => pattern.test(code));
+}
+
+function validateGeneratedCodeContract(code) {
+  const failures = [];
+  if (!/^\s*(import\s+pandas\s+as\s+pd|from\s+pandas\s+import\s+)/m.test(code)) {
+    failures.push('必须 import pandas as pd');
+  }
+  if (/(?:^|\n)\s*INPUT_FILE\s*=/.test(code)) {
+    failures.push('禁止给 INPUT_FILE 重新赋值');
+  }
+  if (/(?:^|\n)\s*OUTPUT_FILE\s*=/.test(code)) {
+    failures.push('禁止给 OUTPUT_FILE 重新赋值');
+  }
+  if (/\b(?:os|sys|pathlib|subprocess|requests|socket|urllib|http|shutil|ctypes)\b/.test(code)) {
+    failures.push('禁止导入或使用沙盒禁用模块');
+  }
+  if (/\b(?:globals|locals|open|eval|exec|compile|__import__)\s*\(/.test(code)) {
+    failures.push('禁止调用沙盒禁用函数');
+  }
+  if (/Alice|Bob|Charlie|dummy|示例文件|example input/i.test(code)) {
+    failures.push('禁止生成示例数据或示例文件');
+  }
+  if (!/OUTPUT_FILE/.test(code)) {
+    failures.push('必须写入 OUTPUT_FILE');
+  }
+  if (failures.length) {
+    throw new Error(`生成代码未满足执行合同：${failures.join('；')}`);
+  }
 }
 
 async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
@@ -481,21 +516,48 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
 function extractCodeBlock(text) {
   if (!text) return '';
   const match = /```(?:python)?\s*([\s\S]*?)```/i.exec(text);
-  return (match ? match[1] : text).trim();
+  return match ? match[1].trim() : '';
 }
 
 async function generateCode(task) {
+  const systemPrompt = [
+    '你是 Python 代码生成器。',
+    '你的整个回复必须只包含一个 Markdown fenced code block，格式必须是 ```python ... ```。',
+    '代码块外禁止输出任何解释、分析、标题、列表或自然语言。',
+    '代码块内第一段有效代码必须包含 import pandas as pd。',
+    'INPUT_FILE 和 OUTPUT_FILE 是沙盒预置全局变量，只能读取使用，绝对禁止重新赋值。',
+    '禁止导入或使用 os、sys、pathlib、subprocess、requests、socket、urllib、http、shutil、ctypes。',
+    '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
+    '禁止创建示例数据、示例文件、dummy 数据，必须处理真实 INPUT_FILE。',
+  ].join('\n');
   const prompt = [
-    '你是严谨的数据处理代码生成器。只输出完整 Python 代码，不要解释，不要 Markdown。',
+    '请严格按以下执行合同生成 Python 源码，并包裹在唯一的 Markdown Python 代码块中。',
+    '',
+    '【执行合同】',
+    '- 整个回复只能是一个 ```python 代码块，代码块外不能有任何文字。',
+    '- 必须使用 INPUT_FILE 读取用户上传文件，必须使用 OUTPUT_FILE 写出结果。',
+    '- 禁止出现 INPUT_FILE = ... 或 OUTPUT_FILE = ...。',
+    '- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。',
+    '- 禁止调用 globals/locals/open/eval/exec/compile/__import__。',
+    '- 禁止创建示例输入文件、示例 DataFrame、dummy/Alice/Bob/Charlie 数据。',
+    '- 必须 import pandas as pd。',
+    '- 必须把结果写入 OUTPUT_FILE，且至少一个 sheet。',
+    '',
+    '【任务】',
     '目标：根据用户需求，为当前上传文件生成定制化 pandas/openpyxl 处理脚本，并在本地沙盒执行。',
-    '硬性约束：',
-    '1. 必须使用全局变量 INPUT_FILE 作为输入路径，必须使用全局变量 OUTPUT_FILE 作为输出路径。',
-    '2. 禁止给 INPUT_FILE 或 OUTPUT_FILE 重新赋值，禁止硬编码 input.xlsx/output.xlsx，禁止创建示例数据或示例文件。',
-    '3. 必须 import pandas as pd；可使用 openpyxl、json、math、statistics、re、decimal、datetime、numpy。',
-    '4. 读取 Excel 时不要假设第一行是表头。必须结合 metadata.rawRows、metadata.mergedCells、metadata.detectedHeaderRowNumber 判断真实表头；必要时用 pd.read_excel(INPUT_FILE, sheet_name=..., header=None) 自己设置列名。',
-    '5. 用户可能通过“提取行数”提供多行表头、合并单元格或标题行；必须尊重这些结构信息。',
-    '6. 必须生成 Excel 文件到 OUTPUT_FILE，至少包含一个结果 sheet；如果有明细，也写入单独 sheet。',
-    '7. 如果需求无法从表头判断，应 raise ValueError 说明缺少哪些列或规则，不要生成无关代码。',
+    '',
+    '【表格读取要求】',
+    '- 不要假设第一行是表头。',
+    '- 必须结合 metadata.rawRows、metadata.mergedCells、metadata.detectedHeaderRowNumber 判断真实表头。',
+    '- 如果 detectedHeaderRowNumber 有值，优先使用它；读取时注意 pandas header/skiprows 是 0-based。',
+    '- 如果多行表头或合并单元格导致列名为空，应根据 rawRows 合成可用列名。',
+    '- 如果用户指定 Sheet1，优先读取 Sheet1；否则使用 metadata.sheetName。',
+    '',
+    '【失败方式】',
+    '- 如果缺少完成需求所需的列，raise ValueError，错误中说明缺少列和当前列名。',
+    '- 不要用无关示例逻辑替代用户需求。',
+    '',
+    '【上下文】',
     `metadata_json = ${JSON.stringify(task.metadata)}`,
     `user_requirement = ${task.requirement}`,
     `temporary_rules = ${task.temporaryRules || '无'}`,
@@ -504,13 +566,14 @@ async function generateCode(task) {
   ].join('\n');
   try {
     const modelText = await callOpenAiCompatible([
-      { role: 'system', content: '生成可直接执行的 Python pandas 脚本。' },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: prompt },
-    ], 0.1, { taskId: task.id, phase: 'generate_code' });
+    ], 0, { taskId: task.id, phase: 'generate_code' });
     const code = extractCodeBlock(modelText);
     if (!code || isSuspiciousGeneratedCode(code)) {
-      throw new Error('模型返回了空代码、示例代码或硬编码输入输出路径，已拒绝执行。');
+      throw new Error('模型未返回合法 Markdown Python 代码块，或返回了示例代码/硬编码输入输出路径，已拒绝执行。');
     }
+    validateGeneratedCodeContract(code);
     return code;
   } catch (error) {
     publish(task, 'error', {
@@ -521,14 +584,24 @@ async function generateCode(task) {
 }
 
 async function repairCode(task, traceback) {
+  const repairSystemPrompt = [
+    '你是 Python 代码修复器。',
+    '你的整个回复必须只包含一个 Markdown fenced code block，格式必须是 ```python ... ```。',
+    '代码块外禁止输出任何解释、分析、标题、列表或自然语言。',
+    '必须保留 INPUT_FILE 和 OUTPUT_FILE 为沙盒预置变量，禁止重新赋值。',
+    '禁止导入或使用 os、sys、pathlib、subprocess、requests、socket、urllib、http、shutil、ctypes。',
+    '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
+    '禁止创建示例数据或示例文件。',
+  ].join('\n');
   const modelText = await callOpenAiCompatible([
-    { role: 'system', content: '修复 Python pandas 脚本。只输出完整 Python 代码，不要解释，不要 Markdown。' },
-    { role: 'user', content: `原代码:\n${task.generatedCode}\n\n报错:\n${traceback}\n\n请修复。硬性要求：必须使用已有全局变量 INPUT_FILE 和 OUTPUT_FILE；禁止给它们重新赋值；禁止硬编码 input.xlsx/output.xlsx；禁止创建示例数据或示例文件；必须 import pandas as pd；读取 Excel 时结合 metadata 判断表头，必要时用 header=None 自动定位真实表头行。\n\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}` },
-  ], 0.1, { taskId: task.id, phase: 'repair_code' });
+    { role: 'system', content: repairSystemPrompt },
+    { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}` },
+  ], 0, { taskId: task.id, phase: 'repair_code' });
   const code = extractCodeBlock(modelText);
   if (!code || isSuspiciousGeneratedCode(code)) {
-    throw new Error('模型修复结果仍是示例代码或包含沙盒禁用/硬编码模式，已拒绝执行。');
+    throw new Error('模型修复结果未返回合法 Markdown Python 代码块，或包含沙盒禁用/硬编码模式，已拒绝执行。');
   }
+  validateGeneratedCodeContract(code);
   return code;
 }
 
