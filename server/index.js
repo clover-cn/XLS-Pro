@@ -9,7 +9,8 @@ loadEnvFile(path.join(ROOT, '.env'));
 
 const DATA_DIR = path.join(ROOT, 'data');
 const RULES_FILE = path.join(DATA_DIR, 'rules.json');
-const TASK_DIR = path.resolve(process.env.TASK_STORAGE_DIR || path.join(ROOT, '.agentic-tasks'));
+const TASK_DIR = resolveProjectPath(process.env.TASK_STORAGE_DIR || '.agentic-tasks');
+const LOG_FILE = path.join(TASK_DIR, 'server-runtime.log');
 const DIST_DIR = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT || 3100);
 const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS || 60000);
@@ -20,6 +21,13 @@ const clients = new Map();
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(TASK_DIR, { recursive: true });
+log('info', 'server_configured', {
+  port: PORT,
+  taskDir: TASK_DIR,
+  model: process.env.OPENAI_MODEL || '',
+  hasApiKey: Boolean(process.env.OPENAI_API_KEY),
+  pythonBin: process.env.PYTHON_BIN || 'python',
+});
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -37,6 +45,64 @@ function loadEnvFile(filePath) {
     if (key && process.env[key] === undefined) {
       process.env[key] = value;
     }
+  }
+}
+
+function resolveProjectPath(value) {
+  return path.isAbsolute(value) ? value : path.join(ROOT, value);
+}
+
+function log(level, message, context = {}) {
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    level,
+    message,
+    ...context,
+  });
+  try {
+    fs.mkdirSync(TASK_DIR, { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${line}\n`, 'utf8');
+  } catch (error) {
+    console.error('log_write_failed', error.message);
+  }
+  console.log(line);
+}
+
+function resetRuntimeLog(reason, context = {}) {
+  try {
+    fs.mkdirSync(TASK_DIR, { recursive: true });
+    fs.writeFileSync(LOG_FILE, '', 'utf8');
+  } catch (error) {
+    console.error('log_reset_failed', error.message);
+  }
+  log('info', 'runtime_log_reset', { reason, ...context });
+}
+
+function appendTaskLog(task, type, payload = {}) {
+  if (!task.dir) return;
+  const safePayload = { ...payload };
+  if (safePayload.task) {
+    safePayload.task = {
+      id: safePayload.task.id,
+      state: safePayload.task.state,
+      message: safePayload.task.message,
+      outputReady: safePayload.task.outputReady,
+    };
+  }
+  if (safePayload.code) {
+    safePayload.code = `[python code ${safePayload.code.length} chars]`;
+  }
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    type,
+    state: task.state,
+    message: payload.message || '',
+    payload: safePayload,
+  });
+  try {
+    fs.appendFileSync(path.join(task.dir, 'task.log'), `${line}\n`, 'utf8');
+  } catch (error) {
+    log('error', 'task_log_write_failed', { taskId: task.id, error: error.message });
   }
 }
 
@@ -141,6 +207,7 @@ function retrieveRules(metadata, requirement, temporaryRules) {
     requirement,
     temporaryRules,
     ...(metadata.columns || []).map((column) => `${column.name} ${column.type}`),
+    ...(metadata.rawRows || []).flatMap((row) => row.values || []),
   ].join(' ');
   return loadRules()
     .map((rule) => ({ ...rule, score: scoreRule(rule, text) }))
@@ -179,28 +246,40 @@ function parseCsvLine(line) {
   return result;
 }
 
-function extractCsvMetadata(filePath) {
+function extractCsvMetadata(filePath, previewRows = 3) {
   const text = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
   const lines = text.split(/\r?\n/).filter((line) => line.trim() !== '');
-  const headers = parseCsvLine(lines[0] || '');
+  const rawRows = lines.slice(0, previewRows).map((line, index) => ({
+    rowNumber: index + 1,
+    values: parseCsvLine(line),
+  }));
+  const headerIndex = rawRows.length > 1
+    ? rawRows.reduce((best, row, index) => (row.values.filter(Boolean).length > rawRows[best].values.filter(Boolean).length ? index : best), 0)
+    : 0;
+  const headers = rawRows[headerIndex]?.values || parseCsvLine(lines[0] || '');
   const rows = lines.slice(1).map(parseCsvLine);
-  const samples = rows.slice(0, 3).map((row) => Object.fromEntries(headers.map((header, index) => [header, row[index] || ''])));
   return {
     fileKind: 'csv',
+    sheetName: 'CSV',
+    sheetNames: ['CSV'],
     totalRows: rows.length,
+    totalColumns: headers.length,
+    previewRows,
+    rawRows,
+    mergedCells: [],
+    detectedHeaderRowNumber: headerIndex + 1,
     columns: headers.map((header, index) => ({
       name: header || `Column ${index + 1}`,
       type: inferType(rows.slice(0, 50).map((row) => row[index] || '')),
     })),
-    samples,
   };
 }
 
-function extractXlsxMetadata(filePath) {
+function extractXlsxMetadata(filePath, previewRows = 3) {
   return new Promise((resolve, reject) => {
     const python = process.env.PYTHON_BIN || 'python';
     const script = path.join(__dirname, 'xlsx_metadata.py');
-    const child = spawn(python, [script, filePath], {
+    const child = spawn(python, [script, filePath, String(previewRows)], {
       windowsHide: true,
       env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
@@ -223,16 +302,23 @@ function extractXlsxMetadata(filePath) {
   });
 }
 
-async function extractMetadata(filePath, filename) {
+async function extractMetadata(filePath, filename, previewRows = 3) {
   const ext = path.extname(filename).toLowerCase();
-  if (ext === '.csv') return extractCsvMetadata(filePath);
-  if (ext === '.xlsx') return extractXlsxMetadata(filePath);
+  if (ext === '.csv') return extractCsvMetadata(filePath, previewRows);
+  if (ext === '.xlsx') return extractXlsxMetadata(filePath, previewRows);
   throw new Error('仅支持 .csv 和 .xlsx 文件');
 }
 
 function publish(task, type, payload = {}) {
   const event = { type, at: new Date().toISOString(), ...payload };
   task.events.push(event);
+  appendTaskLog(task, type, payload);
+  log(type === 'error' ? 'error' : type === 'warning' ? 'warn' : 'info', 'task_event', {
+    taskId: task.id,
+    type,
+    state: task.state,
+    message: payload.message || '',
+  });
   const taskClients = clients.get(task.id) || new Set();
   for (const res of taskClients) {
     res.write(`event: ${type}\n`);
@@ -254,6 +340,7 @@ function publicTask(task) {
     filename: task.filename,
     requirement: task.requirement,
     temporaryRules: task.temporaryRules,
+    previewRows: task.previewRows,
     metadata: task.metadata,
     retrievedRules: task.retrievedRules,
     clarifications: task.clarifications,
@@ -268,7 +355,10 @@ function publicTask(task) {
 }
 
 function needsClarification(task) {
-  const headers = task.metadata.columns.map((column) => column.name).join(' ');
+  const headers = [
+    ...task.metadata.columns.map((column) => column.name),
+    ...(task.metadata.rawRows || []).flatMap((row) => row.values || []),
+  ].join(' ');
   const hasAmount = /金额|借方|贷方|收入|支出|amount|debit|credit/i.test(headers);
   const hasDate = /日期|时间|date|time/i.test(headers);
   const questions = [];
@@ -280,86 +370,112 @@ function needsClarification(task) {
   return questions;
 }
 
-function localCode(task) {
-  const columns = task.metadata.columns.map((column) => column.name);
-  const amountColumn = columns.find((name) => /金额|amount|发生额|收入|支出/i.test(name))
-    || columns.find((name) => /借方|debit/i.test(name))
-    || columns.find((name) => /贷方|credit/i.test(name));
-  const dateColumn = columns.find((name) => /日期|时间|date|time/i.test(name));
-  const summaryColumn = columns.find((name) => /摘要|说明|备注|summary|description|memo/i.test(name));
-  const subjectColumn = columns.find((name) => /科目|账户|account|subject/i.test(name));
-  return `import pandas as pd
-
-input_file = INPUT_FILE
-output_file = OUTPUT_FILE
-
-if input_file.lower().endswith(".csv"):
-    df = pd.read_csv(input_file)
-else:
-    df = pd.read_excel(input_file)
-
-amount_column = ${JSON.stringify(amountColumn || '')}
-date_column = ${JSON.stringify(dateColumn || '')}
-summary_column = ${JSON.stringify(summaryColumn || '')}
-subject_column = ${JSON.stringify(subjectColumn || '')}
-
-result = df.copy()
-
-if amount_column and amount_column in result.columns:
-    numeric_amount = pd.to_numeric(result[amount_column], errors="coerce").fillna(0)
-else:
-    numeric_amount = pd.Series([0] * len(result), index=result.index)
-
-summary_text = result[summary_column].astype(str) if summary_column and summary_column in result.columns else pd.Series([""] * len(result), index=result.index)
-subject_text = result[subject_column].astype(str) if subject_column and subject_column in result.columns else pd.Series([""] * len(result), index=result.index)
-
-refund_mask = summary_text.str.contains("退款", na=False)
-adjusted_amount = numeric_amount.where(~refund_mask, -numeric_amount.abs())
-
-def classify_cash_flow(summary, subject, amount):
-    text = f"{summary} {subject}"
-    if "预付账款" in text:
-        return "经营活动现金流出"
-    if "退款" in text:
-        return "退款调整"
-    if amount >= 0:
-        return "待复核现金流入"
-    return "待复核现金流出"
-
-result["AI_调整后金额"] = adjusted_amount
-result["AI_现金流分类"] = [
-    classify_cash_flow(summary, subject, amount)
-    for summary, subject, amount in zip(summary_text, subject_text, adjusted_amount)
-]
-result["AI_处理说明"] = "本结果由本地沙盒脚本生成，请结合业务规则复核。"
-
-summary = result.groupby("AI_现金流分类", dropna=False)["AI_调整后金额"].sum().reset_index()
-summary = summary.rename(columns={"AI_调整后金额": "分类金额合计"})
-
-with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-    result.to_excel(writer, sheet_name="处理明细", index=False)
-    summary.to_excel(writer, sheet_name="分类汇总", index=False)
-`;
+function isSuspiciousGeneratedCode(code) {
+  const patterns = [
+    /INPUT_FILE\s*=\s*['"][^'"]+['"]/,
+    /OUTPUT_FILE\s*=\s*['"][^'"]+['"]/,
+    /import\s+os\b/,
+    /\bglobals\s*\(/,
+    /Alice|Bob|Charlie|dummy|示例文件|example input/i,
+  ];
+  return patterns.some((pattern) => pattern.test(code));
 }
 
-async function callOpenAiCompatible(messages, temperature = 0.1) {
+async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
   if (!process.env.OPENAI_API_KEY) return null;
   const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const model = process.env.OPENAI_MODEL || 'gpt-4o';
+  const startedAt = Date.now();
+  const requestBody = { model, messages, temperature, stream: true };
+  log('info', 'model_stream_request_started', { ...context, model, baseUrl });
+  log('info', 'model_request_body', { ...context, requestBody });
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
-    body: JSON.stringify({ model, messages, temperature }),
+    body: JSON.stringify(requestBody),
   });
   if (!response.ok) {
     const detail = await response.text();
+    log('error', 'model_stream_request_failed', { ...context, status: response.status, detail: detail.slice(0, 500), responseBody: detail });
     throw new Error(`模型调用失败 ${response.status}: ${detail.slice(0, 500)}`);
   }
-  const data = await response.json();
-  return data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.body || !contentType.includes('text/event-stream')) {
+    const data = await response.json();
+    const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    log('info', 'model_non_stream_completed', {
+      ...context,
+      model,
+      durationMs: Date.now() - startedAt,
+      chars: content ? content.length : 0,
+      responseBody: data,
+    });
+    return content;
+  }
+
+  const decoder = new TextDecoder('utf-8');
+  const reader = response.body.getReader();
+  let buffer = '';
+  let content = '';
+  let sawFirstChunk = false;
+
+  const consumeSseData = (rawData) => {
+    if (!rawData || rawData === '[DONE]') return;
+    try {
+      const payload = JSON.parse(rawData);
+      const delta = payload.choices && payload.choices[0] && payload.choices[0].delta;
+      const text = delta && (delta.content || delta.reasoning_content || '');
+      if (text) {
+        if (!sawFirstChunk) {
+          sawFirstChunk = true;
+          log('info', 'model_stream_first_chunk', {
+            ...context,
+            model,
+            latencyMs: Date.now() - startedAt,
+          });
+        }
+        content += text;
+      }
+    } catch (error) {
+      log('warn', 'model_stream_chunk_parse_failed', { ...context, error: error.message, chunk: rawData.slice(0, 200) });
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split(/\r?\n\r?\n/);
+    buffer = frames.pop() || '';
+    for (const frame of frames) {
+      for (const line of frame.split(/\r?\n/)) {
+        if (line.startsWith('data:')) {
+          consumeSseData(line.slice(5).trim());
+        }
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    for (const line of buffer.split(/\r?\n/)) {
+      if (line.startsWith('data:')) {
+        consumeSseData(line.slice(5).trim());
+      }
+    }
+  }
+
+  log('info', 'model_stream_completed', {
+    ...context,
+    model,
+    durationMs: Date.now() - startedAt,
+    chars: content.length,
+    responseBody: content,
+  });
+  return content;
 }
 
 function extractCodeBlock(text) {
@@ -370,29 +486,50 @@ function extractCodeBlock(text) {
 
 async function generateCode(task) {
   const prompt = [
-    '你是严谨的数据处理代码生成器，只输出 Python 代码，不要解释。',
-    '代码只能使用 pandas/openpyxl/csv/json/math/statistics/re/decimal/datetime/numpy。',
-    '输入路径来自全局变量 INPUT_FILE，输出路径必须写入全局变量 OUTPUT_FILE。',
-    '必须生成 Excel 文件 output.xlsx，至少包含处理明细 sheet。',
-    `文件元数据: ${JSON.stringify(task.metadata)}`,
-    `用户需求: ${task.requirement}`,
-    `临时规则: ${task.temporaryRules || '无'}`,
-    `召回规则: ${JSON.stringify(task.retrievedRules)}`,
-    `澄清回答: ${JSON.stringify(task.clarifications || [])}`,
+    '你是严谨的数据处理代码生成器。只输出完整 Python 代码，不要解释，不要 Markdown。',
+    '目标：根据用户需求，为当前上传文件生成定制化 pandas/openpyxl 处理脚本，并在本地沙盒执行。',
+    '硬性约束：',
+    '1. 必须使用全局变量 INPUT_FILE 作为输入路径，必须使用全局变量 OUTPUT_FILE 作为输出路径。',
+    '2. 禁止给 INPUT_FILE 或 OUTPUT_FILE 重新赋值，禁止硬编码 input.xlsx/output.xlsx，禁止创建示例数据或示例文件。',
+    '3. 必须 import pandas as pd；可使用 openpyxl、json、math、statistics、re、decimal、datetime、numpy。',
+    '4. 读取 Excel 时不要假设第一行是表头。必须结合 metadata.rawRows、metadata.mergedCells、metadata.detectedHeaderRowNumber 判断真实表头；必要时用 pd.read_excel(INPUT_FILE, sheet_name=..., header=None) 自己设置列名。',
+    '5. 用户可能通过“提取行数”提供多行表头、合并单元格或标题行；必须尊重这些结构信息。',
+    '6. 必须生成 Excel 文件到 OUTPUT_FILE，至少包含一个结果 sheet；如果有明细，也写入单独 sheet。',
+    '7. 如果需求无法从表头判断，应 raise ValueError 说明缺少哪些列或规则，不要生成无关代码。',
+    `metadata_json = ${JSON.stringify(task.metadata)}`,
+    `user_requirement = ${task.requirement}`,
+    `temporary_rules = ${task.temporaryRules || '无'}`,
+    `retrieved_rules = ${JSON.stringify(task.retrievedRules)}`,
+    `clarifications = ${JSON.stringify(task.clarifications || [])}`,
   ].join('\n');
-  const modelText = await callOpenAiCompatible([
-    { role: 'system', content: '生成可直接执行的 Python pandas 脚本。' },
-    { role: 'user', content: prompt },
-  ]);
-  return extractCodeBlock(modelText) || localCode(task);
+  try {
+    const modelText = await callOpenAiCompatible([
+      { role: 'system', content: '生成可直接执行的 Python pandas 脚本。' },
+      { role: 'user', content: prompt },
+    ], 0.1, { taskId: task.id, phase: 'generate_code' });
+    const code = extractCodeBlock(modelText);
+    if (!code || isSuspiciousGeneratedCode(code)) {
+      throw new Error('模型返回了空代码、示例代码或硬编码输入输出路径，已拒绝执行。');
+    }
+    return code;
+  } catch (error) {
+    publish(task, 'error', {
+      message: `模型未生成可执行的定制化代码：${error.message}`,
+    });
+    throw error;
+  }
 }
 
 async function repairCode(task, traceback) {
   const modelText = await callOpenAiCompatible([
-    { role: 'system', content: '修复 Python pandas 脚本。只输出完整 Python 代码。' },
-    { role: 'user', content: `原代码:\n${task.generatedCode}\n\n报错:\n${traceback}\n\n请修复，仍使用 INPUT_FILE 和 OUTPUT_FILE。` },
-  ]);
-  return extractCodeBlock(modelText);
+    { role: 'system', content: '修复 Python pandas 脚本。只输出完整 Python 代码，不要解释，不要 Markdown。' },
+    { role: 'user', content: `原代码:\n${task.generatedCode}\n\n报错:\n${traceback}\n\n请修复。硬性要求：必须使用已有全局变量 INPUT_FILE 和 OUTPUT_FILE；禁止给它们重新赋值；禁止硬编码 input.xlsx/output.xlsx；禁止创建示例数据或示例文件；必须 import pandas as pd；读取 Excel 时结合 metadata 判断表头，必要时用 header=None 自动定位真实表头行。\n\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}` },
+  ], 0.1, { taskId: task.id, phase: 'repair_code' });
+  const code = extractCodeBlock(modelText);
+  if (!code || isSuspiciousGeneratedCode(code)) {
+    throw new Error('模型修复结果仍是示例代码或包含沙盒禁用/硬编码模式，已拒绝执行。');
+  }
+  return code;
 }
 
 function writeGeneratedCode(task, code) {
@@ -409,6 +546,13 @@ function runSandbox(task) {
     const script = path.join(task.dir, 'generated.py');
     const output = path.join(task.dir, 'output.xlsx');
     const timeoutSeconds = Math.max(1, Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    log('info', 'sandbox_started', {
+      taskId: task.id,
+      python,
+      timeoutMs: SANDBOX_TIMEOUT_MS,
+      script,
+      output,
+    });
     const child = spawn(python, [runner, script, task.filePath, output, String(timeoutSeconds)], {
       cwd: task.dir,
       windowsHide: true,
@@ -421,14 +565,28 @@ function runSandbox(task) {
     child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
     child.on('error', (error) => {
       clearTimeout(timer);
+      log('error', 'sandbox_spawn_failed', { taskId: task.id, error: error.message });
       resolve({ ok: false, error: error.message });
     });
     child.on('close', () => {
       clearTimeout(timer);
       try {
         const parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
+        log(parsed.ok ? 'info' : 'error', 'sandbox_finished', {
+          taskId: task.id,
+          ok: Boolean(parsed.ok),
+          error: parsed.error || '',
+          detail: (parsed.detail || stderr || '').slice(0, 500),
+          outputExists: fs.existsSync(output),
+        });
         resolve(parsed.ok ? { ok: true, output } : { ok: false, error: parsed.error, detail: parsed.detail || stderr });
       } catch (error) {
+        log('error', 'sandbox_parse_failed', {
+          taskId: task.id,
+          error: error.message,
+          stdout: stdout.slice(0, 500),
+          stderr: stderr.slice(0, 500),
+        });
         resolve({ ok: false, error: stderr || stdout || error.message });
       }
     });
@@ -437,6 +595,7 @@ function runSandbox(task) {
 
 async function executeWorkflow(task) {
   try {
+    log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
     setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
     task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
 
@@ -448,6 +607,7 @@ async function executeWorkflow(task) {
 
     setTaskState(task, 'generating_code', '正在生成 Python 处理脚本');
     writeGeneratedCode(task, await generateCode(task));
+    log('info', 'code_generated', { taskId: task.id, codeLength: task.generatedCode.length });
     publish(task, 'code', { code: task.generatedCode });
 
     let lastError = '';
@@ -456,6 +616,11 @@ async function executeWorkflow(task) {
       const result = await runSandbox(task);
       if (result.ok) {
         task.outputPath = result.output;
+        log('info', 'workflow_completed', {
+          taskId: task.id,
+          outputPath: task.outputPath,
+          outputExists: fs.existsSync(task.outputPath),
+        });
         setTaskState(task, 'completed', '处理完成，可下载结果');
         return;
       }
@@ -470,17 +635,28 @@ async function executeWorkflow(task) {
     }
     setTaskState(task, 'failed', lastError || '沙盒执行失败');
   } catch (error) {
+    log('error', 'workflow_failed', { taskId: task.id, error: error.message });
     setTaskState(task, 'failed', error.message);
   }
 }
 
 async function createTask(req, res) {
+  resetRuntimeLog('new_task_request', {
+    contentType: req.headers['content-type'] || '',
+    contentLength: req.headers['content-length'] || '',
+  });
+  log('info', 'task_create_request_started', {
+    contentType: req.headers['content-type'] || '',
+    contentLength: req.headers['content-length'] || '',
+  });
   const buffer = await readBody(req);
   const parts = parseMultipart(buffer, req.headers['content-type']);
   const file = parts.find((part) => part.name === 'file' && part.filename);
   if (!file) throw new Error('请上传文件');
   const requirement = (parts.find((part) => part.name === 'requirement')?.content.toString('utf8') || '').trim();
   const temporaryRules = (parts.find((part) => part.name === 'temporaryRules')?.content.toString('utf8') || '').trim();
+  const previewRowsRaw = Number((parts.find((part) => part.name === 'previewRows')?.content.toString('utf8') || '3').trim());
+  const previewRows = Math.max(1, Math.min(Number.isFinite(previewRowsRaw) ? previewRowsRaw : 3, 50));
   if (!requirement) throw new Error('请输入处理需求');
 
   const id = crypto.randomUUID();
@@ -489,6 +665,12 @@ async function createTask(req, res) {
   const filename = file.filename.replace(/[^\w\u4e00-\u9fa5.\-() ]/g, '_');
   const filePath = path.join(dir, filename);
   fs.writeFileSync(filePath, file.content);
+  log('info', 'task_file_saved', {
+    taskId: id,
+    filename,
+    sizeBytes: file.content.length,
+    dir,
+  });
 
   const now = new Date().toISOString();
   const task = {
@@ -498,6 +680,7 @@ async function createTask(req, res) {
     filename,
     requirement,
     temporaryRules,
+    previewRows,
     metadata: null,
     retrievedRules: [],
     clarifications: [],
@@ -508,16 +691,25 @@ async function createTask(req, res) {
     updatedAt: now,
   };
   tasks.set(id, task);
+  publish(task, 'state', { state: task.state, message: task.message, task: publicTask(task) });
 
   sendJson(res, 201, publicTask(task));
 
   setImmediate(async () => {
     try {
       setTaskState(task, 'metadata_ready', '正在解析元数据');
-      task.metadata = await extractMetadata(filePath, filename);
+      task.metadata = await extractMetadata(filePath, filename, previewRows);
+      log('info', 'metadata_extracted', {
+        taskId: task.id,
+        columns: task.metadata.columns.length,
+        totalRows: task.metadata.totalRows,
+        fileKind: task.metadata.fileKind,
+        previewRows: task.metadata.previewRows,
+      });
       setTaskState(task, 'metadata_ready', '元数据解析完成');
       executeWorkflow(task);
     } catch (error) {
+      log('error', 'metadata_extract_failed', { taskId: task.id, error: error.message });
       setTaskState(task, 'failed', error.message);
     }
   });
@@ -586,19 +778,29 @@ async function route(req, res) {
       return;
     }
     if (action === 'events' && req.method === 'GET') {
+      log('info', 'sse_connected', { taskId: task.id, existingEvents: task.events.length });
       res.writeHead(200, {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
         'access-control-allow-origin': '*',
       });
+      res.write(`event: connected\n`);
+      res.write(`data: ${JSON.stringify({ type: 'connected', at: new Date().toISOString(), task: publicTask(task) })}\n\n`);
       for (const event of task.events) {
         res.write(`event: ${event.type}\n`);
         res.write(`data: ${JSON.stringify(event)}\n\n`);
       }
+      const keepAlive = setInterval(() => {
+        res.write(`: keepalive ${new Date().toISOString()}\n\n`);
+      }, 15000);
       if (!clients.has(task.id)) clients.set(task.id, new Set());
       clients.get(task.id).add(res);
-      req.on('close', () => clients.get(task.id)?.delete(res));
+      req.on('close', () => {
+        clearInterval(keepAlive);
+        clients.get(task.id)?.delete(res);
+        log('info', 'sse_closed', { taskId: task.id });
+      });
       return;
     }
     if (action === 'clarifications' && req.method === 'POST') {
@@ -625,6 +827,11 @@ async function route(req, res) {
       fs.createReadStream(task.outputPath).pipe(res);
       return;
     }
+    if (action === 'logs' && req.method === 'GET') {
+      const logPath = path.join(task.dir, 'task.log');
+      sendText(res, 200, fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : '', 'text/plain; charset=utf-8');
+      return;
+    }
   }
 
   const staticPath = path.normalize(path.join(DIST_DIR, url.pathname === '/' ? 'index.html' : url.pathname));
@@ -637,9 +844,17 @@ async function route(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  route(req, res).catch((error) => sendJson(res, 400, { error: error.message }));
+  route(req, res).catch((error) => {
+    log('error', 'request_failed', { method: req.method, url: req.url, error: error.message });
+    sendJson(res, 400, { error: error.message });
+  });
+});
+
+server.on('error', (error) => {
+  log('error', 'server_listen_failed', { port: PORT, error: error.message });
+  process.exit(1);
 });
 
 server.listen(PORT, () => {
-  console.log(`Agentic Workflow API listening on http://localhost:${PORT}`);
+  log('info', 'server_listening', { url: `http://localhost:${PORT}` });
 });

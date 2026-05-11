@@ -26,6 +26,11 @@
             <textarea v-model="temporaryRules" name="temporaryRules" rows="4" placeholder="例如：所有带有“退款”的摘要视为负向流水。"></textarea>
           </label>
 
+          <label class="field">
+            <span>表头/结构提取行数</span>
+            <input v-model.number="previewRows" name="previewRows" type="number" min="1" max="50" />
+          </label>
+
           <button class="primary-button" type="submit" :disabled="isSubmitting || !selectedFile || !requirement.trim()">
             {{ isSubmitting ? '创建中' : '创建处理任务' }}
           </button>
@@ -53,6 +58,7 @@
           </div>
           <div class="status-actions">
             <a v-if="task?.outputReady" class="download-link" :href="`/api/tasks/${task.id}/output`">下载结果</a>
+            <a v-if="task" class="download-link" :href="`/api/tasks/${task.id}/logs`" target="_blank" rel="noreferrer">查看日志</a>
             <button type="button" :disabled="!task?.generatedCode" @click="showCode = !showCode">
               {{ showCode ? '隐藏代码' : '查看代码' }}
             </button>
@@ -61,7 +67,7 @@
 
         <section v-if="!task" class="empty-state">
           <h2>上传表格后开始任务</h2>
-          <p>系统会提取列名、字段类型、总行数和前 3 行样本，再召回规则并生成 pandas 脚本。</p>
+          <p>系统会提取前 N 行表头/结构信息、合并单元格和用户需求，再交给模型生成 pandas 脚本。</p>
         </section>
 
         <template v-else>
@@ -80,6 +86,18 @@
                 <div>
                   <dt>类型</dt>
                   <dd>{{ task.metadata?.fileKind ?? '-' }}</dd>
+                </div>
+                <div>
+                  <dt>结构行数</dt>
+                  <dd>{{ task.metadata?.previewRows ?? task.previewRows ?? '-' }}</dd>
+                </div>
+                <div>
+                  <dt>工作表</dt>
+                  <dd>{{ task.metadata?.sheetName ?? '-' }}</dd>
+                </div>
+                <div>
+                  <dt>推测表头</dt>
+                  <dd>第 {{ task.metadata?.detectedHeaderRowNumber ?? '-' }} 行</dd>
                 </div>
               </dl>
               <div class="columns">
@@ -102,22 +120,27 @@
           </section>
 
           <section class="panel">
-            <h3>样本数据</h3>
+            <h3>表头/结构预览</h3>
             <div class="table-wrap">
-              <table v-if="sampleColumns.length">
+              <table v-if="rawColumnIndexes.length">
                 <thead>
                   <tr>
-                    <th v-for="column in sampleColumns" :key="column">{{ column }}</th>
+                    <th>行号</th>
+                    <th v-for="index in rawColumnIndexes" :key="index">列 {{ index + 1 }}</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="(row, rowIndex) in task.metadata?.samples || []" :key="rowIndex">
-                    <td v-for="column in sampleColumns" :key="column">{{ row[column] }}</td>
+                  <tr v-for="row in task.metadata?.rawRows || []" :key="row.rowNumber">
+                    <td>{{ row.rowNumber }}</td>
+                    <td v-for="index in rawColumnIndexes" :key="index">{{ row.values[index] }}</td>
                   </tr>
                 </tbody>
               </table>
-              <p v-else class="muted">元数据解析完成后显示前 3 行样本。</p>
+              <p v-else class="muted">元数据解析完成后显示提取的结构行。</p>
             </div>
+            <p v-if="task.metadata?.mergedCells?.length" class="muted">
+              合并单元格：{{ mergedCellsText }}
+            </p>
           </section>
 
           <section class="timeline">
@@ -167,9 +190,15 @@ type ColumnSummary = {
 
 type MetadataSummary = {
   fileKind: string;
+  sheetName?: string;
+  sheetNames?: string[];
   totalRows: number;
+  totalColumns?: number;
+  previewRows?: number;
+  rawRows?: { rowNumber: number; values: string[] }[];
+  mergedCells?: { range: string; value: string }[];
+  detectedHeaderRowNumber?: number;
   columns: ColumnSummary[];
-  samples: Record<string, string>[];
 };
 
 type KnowledgeRule = {
@@ -185,6 +214,7 @@ type Task = {
   filename: string;
   requirement: string;
   temporaryRules: string;
+  previewRows?: number;
   metadata: MetadataSummary | null;
   retrievedRules: KnowledgeRule[];
   clarifications: { answer: string; at: string }[];
@@ -211,6 +241,7 @@ type AgentEvent = {
 const selectedFile = ref<File | null>(null);
 const requirement = ref('');
 const temporaryRules = ref('');
+const previewRows = ref(3);
 const clarificationAnswer = ref('');
 const rules = ref<KnowledgeRule[]>([]);
 const task = ref<Task | null>(null);
@@ -237,7 +268,15 @@ const statusLabel = computed(() => {
   return statusText[task.value.state] || task.value.message || task.value.state;
 });
 
-const sampleColumns = computed(() => task.value?.metadata?.columns.map((column) => column.name) || []);
+const rawColumnIndexes = computed(() => {
+  const rows = task.value?.metadata?.rawRows || [];
+  const maxLength = rows.reduce((max, row) => Math.max(max, row.values.length), 0);
+  return Array.from({ length: Math.min(maxLength, 24) }, (_, index) => index);
+});
+
+const mergedCellsText = computed(() => (task.value?.metadata?.mergedCells || [])
+  .map((cell) => `${cell.range}${cell.value ? `=${cell.value}` : ''}`)
+  .join('，'));
 
 function onFileChange(event: Event) {
   const input = event.target as HTMLInputElement;
@@ -262,6 +301,12 @@ function connectEvents(id: string) {
   const source = new EventSource(`/api/tasks/${id}/events`);
   eventSource.value = source;
 
+  source.addEventListener('connected', (message) => {
+    const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
+    events.value.unshift({ ...event, message: '事件流已连接' });
+    if (event.task) task.value = event.task;
+  });
+
   source.addEventListener('state', (message) => {
     const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
     events.value.unshift(event);
@@ -276,6 +321,10 @@ function connectEvents(id: string) {
     const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
     events.value.unshift({ ...event, code: 'Python 代码已生成' });
     if (task.value) task.value.generatedCode = event.code || task.value.generatedCode;
+  });
+
+  source.addEventListener('warning', (message) => {
+    events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
   });
 
   source.addEventListener('error', (message) => {
@@ -297,6 +346,7 @@ async function createTask() {
     form.append('file', selectedFile.value);
     form.append('requirement', requirement.value);
     form.append('temporaryRules', temporaryRules.value);
+    form.append('previewRows', String(previewRows.value || 3));
     const response = await fetch('/api/tasks', { method: 'POST', body: form });
     if (!response.ok) {
       const payload = await response.json();

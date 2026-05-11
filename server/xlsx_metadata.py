@@ -3,6 +3,12 @@ import sys
 from pathlib import Path
 
 
+def cell_to_text(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def infer_type(values):
     filtered = [value for value in values if value not in (None, "")]
     if not filtered:
@@ -14,9 +20,23 @@ def infer_type(values):
     return "text"
 
 
+def best_header_index(raw_rows):
+    best_index = 0
+    best_score = -1
+    keywords = ["日期", "摘要", "科目", "借方", "贷方", "金额", "凭证", "编码", "名称"]
+    for index, row in enumerate(raw_rows):
+        values = [cell_to_text(value) for value in row]
+        non_empty = [value for value in values if value]
+        score = len(non_empty) + sum(2 for value in non_empty if any(keyword in value for keyword in keywords))
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index
+
+
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: xlsx_metadata.py <file>")
+    if len(sys.argv) not in (2, 3):
+        raise SystemExit("usage: xlsx_metadata.py <file> [preview_rows]")
 
     try:
         from openpyxl import load_workbook
@@ -24,39 +44,47 @@ def main():
         raise SystemExit(f"openpyxl 不可用，无法解析 .xlsx 元数据: {exc}")
 
     file_path = Path(sys.argv[1])
-    workbook = load_workbook(file_path, read_only=True, data_only=True)
-    sheet = workbook.active
-    rows = sheet.iter_rows(values_only=True)
-    headers = [str(value or "").strip() for value in next(rows, [])]
-    samples_raw = []
+    preview_rows = max(1, min(int(sys.argv[2]) if len(sys.argv) == 3 else 3, 50))
+    workbook = load_workbook(file_path, read_only=False, data_only=True)
+    sheet = workbook["Sheet1"] if "Sheet1" in workbook.sheetnames else workbook.active
+
+    max_column = sheet.max_column or 0
+    raw_rows = []
+    for row_number in range(1, min(sheet.max_row or 0, preview_rows) + 1):
+        values = [cell_to_text(sheet.cell(row=row_number, column=column).value) for column in range(1, max_column + 1)]
+        raw_rows.append({"rowNumber": row_number, "values": values})
+
+    merged_cells = []
+    for merged_range in sheet.merged_cells.ranges:
+        if merged_range.min_row <= preview_rows:
+            merged_cells.append({
+                "range": str(merged_range),
+                "value": cell_to_text(sheet.cell(row=merged_range.min_row, column=merged_range.min_col).value),
+            })
+
+    raw_values = [row["values"] for row in raw_rows]
+    header_index = best_header_index(raw_values) if raw_values else 0
+    headers = raw_values[header_index] if raw_values else []
     scan_values = [[] for _ in headers]
-    total_rows = 0
 
-    for row in rows:
-        total_rows += 1
-        values = list(row)
-        for index, value in enumerate(values[: len(headers)]):
-            if index < len(scan_values) and len(scan_values[index]) < 50:
-                scan_values[index].append(value)
-        if len(samples_raw) < 3:
-            samples_raw.append(values)
-
-    samples = [
-        {
-            headers[index] or f"Column {index + 1}": "" if index >= len(row) or row[index] is None else str(row[index])
-            for index in range(len(headers))
-        }
-        for row in samples_raw
-    ]
+    for row in sheet.iter_rows(min_row=header_index + 2, max_row=min(sheet.max_row or 0, header_index + 51), values_only=True):
+        for index, value in enumerate(list(row)[: len(headers)]):
+            scan_values[index].append(value)
 
     payload = {
         "fileKind": "xlsx",
-        "totalRows": total_rows,
+        "sheetName": sheet.title,
+        "sheetNames": workbook.sheetnames,
+        "totalRows": sheet.max_row or 0,
+        "totalColumns": max_column,
+        "previewRows": preview_rows,
+        "rawRows": raw_rows,
+        "mergedCells": merged_cells,
+        "detectedHeaderRowNumber": header_index + 1 if raw_rows else None,
         "columns": [
             {"name": header or f"Column {index + 1}", "type": infer_type(scan_values[index])}
             for index, header in enumerate(headers)
         ],
-        "samples": samples,
     }
     print(json.dumps(payload, ensure_ascii=False))
 

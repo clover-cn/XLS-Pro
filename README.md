@@ -3,7 +3,7 @@
 这个项目把默认 Vue 示例替换为一个本地端到端的 AI 表格处理工作台：
 
 - 前端上传 `.csv` / `.xlsx`，输入核心需求和本次特例规则。
-- Node BFF 只提取表头、字段类型、总行数和前 3 行样本，召回本地规则库。
+- Node BFF 只提取用户指定的前 N 行表头/结构信息、合并单元格、字段类型和总行数，召回本地规则库。
 - Agent 在信息不足时进入澄清状态，用户回答后继续生成代码。
 - Python 沙盒执行生成的 pandas 脚本，只读取当前任务文件并输出 `output.xlsx`。
 
@@ -18,7 +18,7 @@ TASK_STORAGE_DIR=.agentic-tasks
 SANDBOX_TIMEOUT_MS=60000
 ```
 
-没有 `OPENAI_API_KEY` 时，系统会使用本地兜底脚本生成器，适合先验证上传、澄清和沙盒流程。
+`OPENAI_API_KEY` 必须配置。系统会把结构信息和用户需求交给模型生成定制 Python；如果模型失败或返回示例/硬编码脚本，任务会失败并写入日志，不再静默改跑无关脚本。
 
 当前机器上的 `python` 命令可能指向 WindowsApps 启动器；处理 `.xlsx` 和执行沙盒前，请配置真实的 `PYTHON_BIN`，并确保安装：
 
@@ -40,6 +40,36 @@ pnpm run serve
 ```bash
 pnpm run build
 pnpm run api
+```
+
+## 本地复测沙盒代码
+
+不想每次重新上传文件时，可以直接复用 `.agentic-tasks` 里的任务目录：
+
+```bash
+pnpm run test:task -- latest
+```
+
+这会运行最近一次任务的 `generated.py`，输出 `output-rerun.xlsx`，用于验证沙盒执行，不会重新上传文件。
+
+如果只想验证本地沙盒环境，不调用模型：
+
+```bash
+pnpm run test:task -- latest --local
+```
+
+这会生成 `local-smoke.py` 并输出 `output-smoke.xlsx`。
+
+也可以指定任务 ID：
+
+```bash
+pnpm run test:task -- 837b9625-7722-4e8d-92fe-8eeef220b63e --local
+```
+
+带具体需求复测：
+
+```powershell
+pnpm run test:task -- latest --local --requirement '计算出Sheet1里面所有科目的"杜潇"的借方总和'
 ```
 
 ## 本地规则库
