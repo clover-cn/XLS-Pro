@@ -1,8 +1,9 @@
 .DS_Store
 node_modules
 /dist
-
-
+.agentic-tasks
+.env
+.venv
 # local env files
 .env.local
 .env.*.local

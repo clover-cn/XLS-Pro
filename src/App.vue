@@ -1,27 +1,690 @@
 <template>
-  <img alt="Vue logo" src="./assets/logo.png">
-  <HelloWorld msg="Welcome to Your Vue.js + TypeScript App"/>
+  <main class="app-shell">
+    <section class="workspace">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">AW</span>
+          <div>
+            <h1>AI 表格自动化</h1>
+            <p>本地沙盒执行，模型只接收元数据与样本。</p>
+          </div>
+        </div>
+
+        <form class="upload-form" @submit.prevent="createTask">
+          <label class="field">
+            <span>源文件</span>
+            <input name="sourceFile" type="file" accept=".csv,.xlsx" @change="onFileChange" />
+          </label>
+
+          <label class="field">
+            <span>核心需求</span>
+            <textarea v-model="requirement" name="requirement" rows="6" placeholder="例如：根据这个序时账编制现金流量表，并输出分类汇总。"></textarea>
+          </label>
+
+          <label class="field">
+            <span>本次特例规则</span>
+            <textarea v-model="temporaryRules" name="temporaryRules" rows="4" placeholder="例如：所有带有“退款”的摘要视为负向流水。"></textarea>
+          </label>
+
+          <button class="primary-button" type="submit" :disabled="isSubmitting || !selectedFile || !requirement.trim()">
+            {{ isSubmitting ? '创建中' : '创建处理任务' }}
+          </button>
+        </form>
+
+        <div class="rule-editor">
+          <div class="section-title">
+            <h2>长期规则库</h2>
+            <button type="button" @click="loadRules">刷新</button>
+          </div>
+          <div class="rule-list">
+            <article v-for="rule in rules" :key="rule.id" class="rule-item">
+              <strong>{{ rule.condition }}</strong>
+              <span>{{ rule.action }}</span>
+            </article>
+          </div>
+        </div>
+      </aside>
+
+      <section class="main-panel">
+        <header class="status-bar">
+          <div>
+            <span class="eyebrow">当前状态</span>
+            <h2>{{ statusLabel }}</h2>
+          </div>
+          <div class="status-actions">
+            <a v-if="task?.outputReady" class="download-link" :href="`/api/tasks/${task.id}/output`">下载结果</a>
+            <button type="button" :disabled="!task?.generatedCode" @click="showCode = !showCode">
+              {{ showCode ? '隐藏代码' : '查看代码' }}
+            </button>
+          </div>
+        </header>
+
+        <section v-if="!task" class="empty-state">
+          <h2>上传表格后开始任务</h2>
+          <p>系统会提取列名、字段类型、总行数和前 3 行样本，再召回规则并生成 pandas 脚本。</p>
+        </section>
+
+        <template v-else>
+          <section class="grid">
+            <article class="panel">
+              <h3>文件元数据</h3>
+              <dl class="meta-list">
+                <div>
+                  <dt>文件</dt>
+                  <dd>{{ task.filename }}</dd>
+                </div>
+                <div>
+                  <dt>行数</dt>
+                  <dd>{{ task.metadata?.totalRows ?? '-' }}</dd>
+                </div>
+                <div>
+                  <dt>类型</dt>
+                  <dd>{{ task.metadata?.fileKind ?? '-' }}</dd>
+                </div>
+              </dl>
+              <div class="columns">
+                <span v-for="column in task.metadata?.columns || []" :key="column.name">
+                  {{ column.name }} · {{ column.type }}
+                </span>
+              </div>
+            </article>
+
+            <article class="panel">
+              <h3>召回规则</h3>
+              <div v-if="task.retrievedRules.length" class="rule-list compact">
+                <article v-for="rule in task.retrievedRules" :key="rule.id" class="rule-item">
+                  <strong>{{ rule.condition }}</strong>
+                  <span>{{ rule.action }}</span>
+                </article>
+              </div>
+              <p v-else class="muted">暂无命中规则。</p>
+            </article>
+          </section>
+
+          <section class="panel">
+            <h3>样本数据</h3>
+            <div class="table-wrap">
+              <table v-if="sampleColumns.length">
+                <thead>
+                  <tr>
+                    <th v-for="column in sampleColumns" :key="column">{{ column }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(row, rowIndex) in task.metadata?.samples || []" :key="rowIndex">
+                    <td v-for="column in sampleColumns" :key="column">{{ row[column] }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p v-else class="muted">元数据解析完成后显示前 3 行样本。</p>
+            </div>
+          </section>
+
+          <section class="timeline">
+            <h3>任务事件</h3>
+            <ol>
+              <li v-for="(event, index) in events" :key="`${event.at}-${index}`">
+                <span>{{ formatTime(event.at) }}</span>
+                <strong>{{ event.state || event.type }}</strong>
+                <p>{{ event.message || event.answer || event.code || event.error || '已更新' }}</p>
+              </li>
+            </ol>
+          </section>
+
+          <section v-if="showCode" class="code-panel">
+            <h3>生成的 Python 代码</h3>
+            <pre>{{ task.generatedCode || '代码生成后会显示在这里。' }}</pre>
+          </section>
+        </template>
+      </section>
+    </section>
+
+    <div v-if="task?.state === 'needs_clarification'" class="dialog-backdrop">
+      <section class="dialog">
+        <h2>需要人工确认</h2>
+        <ul>
+          <li v-for="question in currentQuestions" :key="question">{{ question }}</li>
+        </ul>
+        <textarea v-model="clarificationAnswer" name="clarificationAnswer" rows="5" placeholder="请逐条回答 Agent 的问题。"></textarea>
+        <div class="dialog-actions">
+          <button type="button" @click="clarificationAnswer = ''">清空</button>
+          <button class="primary-button" type="button" :disabled="!clarificationAnswer.trim()" @click="submitClarification">
+            提交并继续
+          </button>
+        </div>
+      </section>
+    </div>
+  </main>
 </template>
 
-<script lang="ts">
-import { Options, Vue } from 'vue-class-component';
-import HelloWorld from './components/HelloWorld.vue';
+<script setup lang="ts">
+import { computed, onMounted, ref } from 'vue';
 
-@Options({
-  components: {
-    HelloWorld,
-  },
-})
-export default class App extends Vue {}
+type ColumnSummary = {
+  name: string;
+  type: string;
+};
+
+type MetadataSummary = {
+  fileKind: string;
+  totalRows: number;
+  columns: ColumnSummary[];
+  samples: Record<string, string>[];
+};
+
+type KnowledgeRule = {
+  id: string;
+  condition: string;
+  action: string;
+  tags?: string[];
+  score?: number;
+};
+
+type Task = {
+  id: string;
+  filename: string;
+  requirement: string;
+  temporaryRules: string;
+  metadata: MetadataSummary | null;
+  retrievedRules: KnowledgeRule[];
+  clarifications: { answer: string; at: string }[];
+  generatedCode: string;
+  state: string;
+  message: string;
+  outputReady: boolean;
+  createdAt: string;
+  updatedAt: string;
+  questions?: string[];
+};
+
+type AgentEvent = {
+  type: string;
+  at: string;
+  state?: string;
+  message?: string;
+  answer?: string;
+  code?: string;
+  error?: string;
+  task?: Task;
+};
+
+const selectedFile = ref<File | null>(null);
+const requirement = ref('');
+const temporaryRules = ref('');
+const clarificationAnswer = ref('');
+const rules = ref<KnowledgeRule[]>([]);
+const task = ref<Task | null>(null);
+const events = ref<AgentEvent[]>([]);
+const isSubmitting = ref(false);
+const showCode = ref(false);
+const eventSource = ref<EventSource | null>(null);
+const currentQuestions = ref<string[]>([]);
+
+const statusText: Record<string, string> = {
+  uploaded: '文件已上传',
+  metadata_ready: '元数据已解析',
+  retrieving_rules: '正在召回规则',
+  needs_clarification: '等待人工确认',
+  generating_code: '正在生成代码',
+  executing: '正在沙盒执行',
+  repairing: '正在自修复',
+  completed: '处理完成',
+  failed: '处理失败',
+};
+
+const statusLabel = computed(() => {
+  if (!task.value) return '等待创建任务';
+  return statusText[task.value.state] || task.value.message || task.value.state;
+});
+
+const sampleColumns = computed(() => task.value?.metadata?.columns.map((column) => column.name) || []);
+
+function onFileChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  selectedFile.value = input.files?.[0] || null;
+}
+
+async function loadRules() {
+  const response = await fetch('/api/rules');
+  rules.value = await response.json();
+}
+
+async function refreshTask(id: string) {
+  const response = await fetch(`/api/tasks/${id}`);
+  if (response.ok) {
+    task.value = await response.json();
+  }
+}
+
+function connectEvents(id: string) {
+  eventSource.value?.close();
+  events.value = [];
+  const source = new EventSource(`/api/tasks/${id}/events`);
+  eventSource.value = source;
+
+  source.addEventListener('state', (message) => {
+    const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
+    events.value.unshift(event);
+    if (event.task) task.value = event.task;
+    if (event.task?.questions) currentQuestions.value = event.task.questions;
+    if (event.state === 'completed' || event.state === 'failed') {
+      refreshTask(id);
+    }
+  });
+
+  source.addEventListener('code', (message) => {
+    const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
+    events.value.unshift({ ...event, code: 'Python 代码已生成' });
+    if (task.value) task.value.generatedCode = event.code || task.value.generatedCode;
+  });
+
+  source.addEventListener('error', (message) => {
+    if ((message as MessageEvent).data) {
+      events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
+    }
+  });
+
+  source.addEventListener('clarification', (message) => {
+    events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
+  });
+}
+
+async function createTask() {
+  if (!selectedFile.value) return;
+  isSubmitting.value = true;
+  try {
+    const form = new FormData();
+    form.append('file', selectedFile.value);
+    form.append('requirement', requirement.value);
+    form.append('temporaryRules', temporaryRules.value);
+    const response = await fetch('/api/tasks', { method: 'POST', body: form });
+    if (!response.ok) {
+      const payload = await response.json();
+      throw new Error(payload.error || '任务创建失败');
+    }
+    task.value = await response.json();
+    currentQuestions.value = [];
+    connectEvents(task.value.id);
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '任务创建失败');
+  } finally {
+    isSubmitting.value = false;
+  }
+}
+
+async function submitClarification() {
+  if (!task.value) return;
+  const response = await fetch(`/api/tasks/${task.value.id}/clarifications`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ answer: clarificationAnswer.value }),
+  });
+  if (response.ok) {
+    task.value = await response.json();
+    clarificationAnswer.value = '';
+    currentQuestions.value = [];
+  }
+}
+
+function formatTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value));
+}
+
+onMounted(loadRules);
 </script>
 
 <style>
-#app {
-  font-family: Avenir, Helvetica, Arial, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-align: center;
-  color: #2c3e50;
-  margin-top: 60px;
+:root {
+  color: #18201c;
+  background: #f4f6f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f4f6f2;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button,
+.download-link {
+  min-height: 40px;
+  border: 1px solid #aeb8ad;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1d2a22;
+  cursor: pointer;
+  padding: 0 14px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.primary-button {
+  border-color: #1f7a57;
+  background: #1f7a57;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.app-shell {
+  min-height: 100vh;
+  font-family: Inter, "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+}
+
+.workspace {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+}
+
+.sidebar {
+  border-right: 1px solid #d9dfd7;
+  background: #ffffff;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+.brand-mark {
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  background: #d9eee5;
+  color: #0c6845;
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+}
+
+.brand h1,
+.brand p,
+.section-title h2,
+.panel h3,
+.empty-state h2,
+.dialog h2 {
+  margin: 0;
+}
+
+.brand h1 {
+  font-size: 20px;
+}
+
+.brand p,
+.muted {
+  color: #607067;
+}
+
+.upload-form,
+.field,
+.rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field span {
+  font-weight: 700;
+}
+
+.field input,
+.field textarea,
+.dialog textarea {
+  width: 100%;
+  border: 1px solid #cbd4ca;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #fbfcfa;
+  resize: vertical;
+}
+
+.section-title,
+.status-bar,
+.status-actions,
+.dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section-title h2 {
+  font-size: 16px;
+}
+
+.rule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rule-item {
+  border: 1px solid #dbe2d9;
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #fbfcfa;
+}
+
+.rule-item strong {
+  font-size: 13px;
+}
+
+.rule-item span {
+  color: #526259;
+  font-size: 13px;
+}
+
+.main-panel {
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+.status-bar {
+  border-bottom: 1px solid #d9dfd7;
+  padding-bottom: 20px;
+}
+
+.eyebrow {
+  color: #64736a;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.status-bar h2 {
+  margin: 4px 0 0;
+  font-size: 28px;
+}
+
+.empty-state,
+.panel,
+.timeline,
+.code-panel {
+  background: #ffffff;
+  border: 1px solid #d9dfd7;
+  border-radius: 8px;
+  padding: 18px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.meta-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.meta-list div {
+  border-left: 3px solid #6a9f89;
+  padding-left: 10px;
+}
+
+.meta-list dt {
+  color: #64736a;
+  font-size: 12px;
+}
+
+.meta-list dd {
+  margin: 4px 0 0;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.columns span {
+  border: 1px solid #cbd8d1;
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: #eef7f2;
+  font-size: 12px;
+}
+
+.table-wrap {
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  border-bottom: 1px solid #e5eae3;
+  padding: 10px;
+  text-align: left;
+  vertical-align: top;
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+
+th {
+  background: #eef2ec;
+  position: sticky;
+  top: 0;
+}
+
+.timeline ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.timeline li {
+  display: grid;
+  grid-template-columns: 86px 150px minmax(0, 1fr);
+  gap: 12px;
+  border-bottom: 1px solid #e6ebe4;
+  padding-bottom: 10px;
+}
+
+.timeline span {
+  color: #64736a;
+}
+
+.timeline p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.code-panel pre {
+  margin: 0;
+  max-height: 420px;
+  overflow: auto;
+  background: #17211d;
+  color: #e6f3ed;
+  border-radius: 6px;
+  padding: 16px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(24, 32, 28, 0.45);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.dialog {
+  width: min(640px, 100%);
+  background: #ffffff;
+  border-radius: 8px;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 20px 60px rgba(24, 32, 28, 0.24);
+}
+
+.dialog ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+@media (max-width: 980px) {
+  .workspace,
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #d9dfd7;
+  }
+
+  .status-bar,
+  .timeline li {
+    grid-template-columns: 1fr;
+    align-items: flex-start;
+  }
 }
 </style>
