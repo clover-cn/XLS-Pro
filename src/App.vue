@@ -43,10 +43,19 @@
           </div>
           <div class="rule-list">
             <article v-for="rule in rules" :key="rule.id" class="rule-item">
-              <strong>{{ rule.condition }}</strong>
-              <span>{{ rule.action }}</span>
+              <div class="rule-content">
+                <strong>{{ rule.condition }}</strong>
+                <span>{{ rule.action }}</span>
+              </div>
+              <button type="button" class="icon-button" @click="deleteRule(rule.id)" title="删除规则">×</button>
             </article>
+            <p v-if="rules.length === 0" class="muted" style="font-size: 13px;">暂无长期规则</p>
           </div>
+          <form class="add-rule-form" @submit.prevent="addRule">
+            <input v-model="newRule.condition" placeholder="条件 (如: 遇到退款)" required />
+            <input v-model="newRule.action" placeholder="动作 (如: 记为负数)" required />
+            <button type="submit" :disabled="!newRule.condition || !newRule.action">添加</button>
+          </form>
         </div>
       </aside>
 
@@ -301,6 +310,7 @@ const temporaryRules = ref('');
 const previewRows = ref(3);
 const clarificationAnswer = ref('');
 const rules = ref<KnowledgeRule[]>([]);
+const newRule = ref({ condition: '', action: '' });
 const task = ref<Task | null>(null);
 const events = ref<AgentEvent[]>([]);
 const logText = ref('');
@@ -415,6 +425,27 @@ function onFileChange(event: Event) {
 async function loadRules() {
   const response = await fetch('/api/rules');
   rules.value = await response.json();
+}
+
+async function addRule() {
+  if (!newRule.value.condition || !newRule.value.action) return;
+  const response = await fetch('/api/rules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(newRule.value),
+  });
+  if (response.ok) {
+    newRule.value = { condition: '', action: '' };
+    await loadRules();
+  }
+}
+
+async function deleteRule(id: string) {
+  if (!confirm('确定要删除这条长期规则吗？')) return;
+  const response = await fetch(`/api/rules/${id}`, { method: 'DELETE' });
+  if (response.ok) {
+    await loadRules();
+  }
 }
 
 async function refreshTask(id: string) {
@@ -732,9 +763,16 @@ button:disabled {
   border-radius: 6px;
   padding: 10px;
   display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  background: #fbfcfa;
+}
+
+.rule-content {
+  display: flex;
   flex-direction: column;
   gap: 4px;
-  background: #fbfcfa;
 }
 
 .rule-item strong {
@@ -743,6 +781,42 @@ button:disabled {
 
 .rule-item span {
   color: #526259;
+  font-size: 13px;
+}
+
+.icon-button {
+  min-height: auto;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: #8c9b93;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  color: #c93b32;
+  background: #fbeae9;
+  border-radius: 4px;
+}
+
+.add-rule-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.add-rule-form input {
+  font-size: 13px;
+  padding: 8px 10px;
+}
+
+.add-rule-form button {
+  min-height: 32px;
   font-size: 13px;
 }
 
