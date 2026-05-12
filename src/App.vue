@@ -77,10 +77,12 @@
                 </div>
                 <button type="button" @click="fetchTaskLogs">刷新</button>
               </div>
-              <pre class="log-output">{{ logText || compactEventsLog }}</pre>
+              <div class="terminal-window">
+                <pre class="log-output"><span>{{ logText || compactEventsLog }}</span><span class="cursor-blink-inline"></span></pre>
+              </div>
             </article>
 
-            <article class="panel execution-panel">
+            <article class="panel execution-panel" :class="{ 'is-active-agent': task && ['generating_code', 'executing', 'repairing'].includes(task.state) }">
               <div class="panel-header">
                 <div>
                   <h3>Python 执行窗口</h3>
@@ -759,27 +761,123 @@ button:disabled {
 
 .log-output,
 .code-window {
-  flex: 1;
   margin: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  max-height: 500px;
   border-radius: 6px;
   padding: 14px;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  font-family: "Fira Code", Consolas, Monaco, "Courier New", Courier, monospace;
+}
+
+/* Custom Scrollbar for agent windows */
+.log-output::-webkit-scrollbar,
+.code-window::-webkit-scrollbar {
+  width: 6px;
+}
+.log-output::-webkit-scrollbar-track,
+.code-window::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+.log-output::-webkit-scrollbar-thumb,
+.code-window::-webkit-scrollbar-thumb {
+  background: #3e5a4a;
+  border-radius: 3px;
+}
+.log-output::-webkit-scrollbar-thumb:hover,
+.code-window::-webkit-scrollbar-thumb:hover {
+  background: #5c856f;
+}
+
+.terminal-window {
+  flex: 1;
+  background: #0a0f0d;
+  border-radius: 6px;
+  border: 1px solid #1c2b23;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  box-shadow: inset 0 0 20px rgba(12, 104, 69, 0.1);
 }
 
 .log-output {
-  background: #101815;
-  color: #d7efe5;
+  flex: 1;
+  background: transparent;
+  color: #4ade80;
+  text-shadow: 0 0 4px rgba(74, 222, 128, 0.3);
+  padding: 0;
   min-height: 320px;
 }
 
+.cursor-blink-inline {
+  display: inline-block;
+  width: 8px;
+  height: 14px;
+  background-color: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+  animation: blink 1s step-end infinite;
+  vertical-align: text-bottom;
+  margin-left: 4px;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
 .code-window {
-  background: #17211d;
+  background: #121815;
   color: #e6f3ed;
   min-height: 260px;
+  border: 1px solid #1c2b23;
+}
+
+/* Agent Execution Animations */
+.execution-panel {
+  position: relative;
+  overflow: hidden;
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.execution-panel.is-active-agent {
+  border-color: #2b8b60;
+  box-shadow: 0 0 15px rgba(43, 139, 96, 0.2);
+  animation: breathe 2s ease-in-out infinite;
+}
+
+.execution-panel.is-active-agent::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 120px;
+  background: linear-gradient(
+    to bottom,
+    rgba(74, 222, 128, 0) 0%,
+    rgba(74, 222, 128, 0.05) 50%,
+    rgba(74, 222, 128, 0.2) 100%
+  );
+  border-bottom: 1px solid rgba(74, 222, 128, 0.5);
+  box-shadow: 0 5px 15px rgba(74, 222, 128, 0.15);
+  animation: scan 2.5s linear infinite;
+  pointer-events: none;
+  z-index: 10;
+}
+
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 15px rgba(43, 139, 96, 0.1); border-color: #1f7a57; }
+  50% { box-shadow: 0 0 25px rgba(43, 139, 96, 0.3); border-color: #4ade80; }
+}
+
+@keyframes scan {
+  0% { transform: translateY(-120px); }
+  100% { transform: translateY(1000px); }
 }
 
 .status-pill {
