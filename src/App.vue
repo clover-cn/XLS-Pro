@@ -78,7 +78,16 @@
                 <button type="button" @click="fetchTaskLogs">刷新</button>
               </div>
               <div class="terminal-window">
-                <pre class="log-output"><span>{{ logText || compactEventsLog }}</span><span class="cursor-blink-inline"></span></pre>
+                <div class="log-output" ref="logContainer">
+                  <div v-for="(line, index) in parsedLogLines" :key="index" :class="['log-line', `log-state-${line.state}`]">
+                    <template v-if="!line.raw && line.time">
+                      <span class="log-time">[{{ line.time }}]</span>
+                      <span class="log-arrow">></span>
+                    </template>
+                    <span class="log-text">{{ line.text }}</span>
+                  </div>
+                  <div><span class="cursor-blink-inline"></span></div>
+                </div>
               </div>
             </article>
 
@@ -228,7 +237,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue';
 
 type ColumnSummary = {
   name: string;
@@ -301,6 +310,51 @@ const currentQuestions = ref<string[]>([]);
 const clarificationDismissed = ref(false);
 const taskPollingTimer = ref<number | null>(null);
 const logPollingTimer = ref<number | null>(null);
+
+const logContainer = ref<HTMLElement | null>(null);
+
+const parsedLogLines = computed(() => {
+  if (!logText.value) {
+    return [...events.value].reverse().map(event => {
+      const time = formatTime(event.at);
+      const text = event.message || event.answer || event.error || event.state || event.type || '已更新';
+      return {
+        time,
+        text,
+        state: event.state || event.type || 'info',
+        raw: false
+      };
+    });
+  }
+
+  return logText.value.split('\n').filter(line => line.trim()).map(line => {
+    try {
+      const obj = JSON.parse(line);
+      const time = obj.at ? formatTime(obj.at) : '';
+      const text = obj.message || obj.answer || obj.error || obj.state || obj.type || line;
+      return {
+        time,
+        text,
+        state: obj.state || obj.type || (obj.error ? 'failed' : 'info'),
+        raw: false
+      };
+    } catch (e) {
+      return {
+        time: '',
+        text: line,
+        state: 'raw',
+        raw: true
+      };
+    }
+  });
+});
+
+watch(parsedLogLines, async () => {
+  await nextTick();
+  if (logContainer.value) {
+    logContainer.value.scrollTop = logContainer.value.scrollHeight;
+  }
+}, { deep: true });
 
 const statusText: Record<string, string> = {
   uploaded: '文件已上传',
@@ -812,6 +866,54 @@ button:disabled {
   text-shadow: 0 0 4px rgba(74, 222, 128, 0.3);
   padding: 0;
   min-height: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.log-line {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  word-break: break-all;
+}
+
+.log-time {
+  color: #6a9f89;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.log-arrow {
+  color: #4ade80;
+  font-weight: bold;
+}
+
+.log-text {
+  flex: 1;
+}
+
+.log-state-failed, .log-state-error {
+  color: #fca5a5;
+  text-shadow: 0 0 4px rgba(252, 165, 165, 0.3);
+}
+
+.log-state-executing, .log-state-generating_code, .log-state-repairing {
+  color: #fde047;
+  text-shadow: 0 0 4px rgba(253, 224, 71, 0.3);
+}
+
+.log-state-completed {
+  color: #86efac;
+}
+
+.log-state-raw {
+  color: #aeb8ad;
+  text-shadow: none;
+}
+
+.log-state-info {
+  color: #4ade80;
 }
 
 .cursor-blink-inline {
