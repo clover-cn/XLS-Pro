@@ -348,6 +348,7 @@ function publicTask(task) {
     state: task.state,
     message: task.message,
     outputReady: Boolean(task.outputPath && fs.existsSync(task.outputPath)),
+    executionWarning: task.executionWarning || '',
     questions: task.questions || [],
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
@@ -652,8 +653,32 @@ function runSandbox(task) {
           detail: (parsed.detail || stderr || '').slice(0, 500),
           outputExists: fs.existsSync(output),
         });
-        resolve(parsed.ok ? { ok: true, output } : { ok: false, error: parsed.error, detail: parsed.detail || stderr });
+        if (parsed.ok) {
+          resolve({ ok: true, output });
+          return;
+        }
+        if (fs.existsSync(output)) {
+          const warning = [parsed.error, parsed.detail || stderr].filter(Boolean).join('\n').trim();
+          log('warn', 'sandbox_output_accepted_with_warning', {
+            taskId: task.id,
+            output,
+            warning: warning.slice(0, 500),
+          });
+          resolve({ ok: true, output, warning });
+          return;
+        }
+        resolve({ ok: false, error: parsed.error, detail: parsed.detail || stderr });
       } catch (error) {
+        if (fs.existsSync(output)) {
+          const warning = (stderr || stdout || error.message || '沙盒输出解析失败').trim();
+          log('warn', 'sandbox_unparseable_output_accepted', {
+            taskId: task.id,
+            output,
+            warning: warning.slice(0, 500),
+          });
+          resolve({ ok: true, output, warning });
+          return;
+        }
         log('error', 'sandbox_parse_failed', {
           taskId: task.id,
           error: error.message,
@@ -689,12 +714,20 @@ async function executeWorkflow(task) {
       const result = await runSandbox(task);
       if (result.ok) {
         task.outputPath = result.output;
+        task.executionWarning = result.warning || '';
+        if (task.executionWarning) {
+          publish(task, 'warning', {
+            message: `结果文件已生成，但执行过程中出现警告：${task.executionWarning}`,
+            task: publicTask(task),
+          });
+        }
         log('info', 'workflow_completed', {
           taskId: task.id,
           outputPath: task.outputPath,
           outputExists: fs.existsSync(task.outputPath),
+          warning: task.executionWarning,
         });
-        setTaskState(task, 'completed', '处理完成，可下载结果');
+        setTaskState(task, 'completed', task.executionWarning ? '处理完成，可下载结果（执行有警告）' : '处理完成，可下载结果');
         return;
       }
       lastError = `${result.error || ''}\n${result.detail || ''}`.trim();

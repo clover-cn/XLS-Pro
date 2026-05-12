@@ -128,9 +128,13 @@
                 {{ task.message }}
               </div>
 
-              <div v-if="task.outputReady" class="success-box">
-                结果文件已生成，可以下载。
+              <div v-if="task.outputReady" class="success-box" :class="{ 'has-warning': task.executionWarning }">
+                <span>{{ task.executionWarning ? '结果文件已生成，可下载；执行过程中存在警告。' : '结果文件已生成，可以下载。' }}</span>
                 <a class="download-link" :href="downloadUrl">下载结果</a>
+              </div>
+
+              <div v-if="task.outputReady && task.executionWarning" class="warning-box">
+                {{ task.executionWarning }}
               </div>
 
               <pre class="code-window">{{ task.generatedCode || '模型生成 Python 代码后会显示在这里。' }}</pre>
@@ -287,6 +291,7 @@ type Task = {
   state: string;
   message: string;
   outputReady: boolean;
+  executionWarning?: string;
   createdAt: string;
   updatedAt: string;
   questions?: string[];
@@ -392,6 +397,7 @@ const executionMessage = computed(() => {
   if (task.value.state === 'generating_code') return '模型正在生成可执行 Python 代码。';
   if (task.value.state === 'executing') return '沙盒正在运行生成的 Python 脚本。';
   if (task.value.state === 'repairing') return '脚本执行失败，模型正在自修复并重试。';
+  if (task.value.state === 'completed' && task.value.executionWarning) return '结果文件已生成，执行过程中存在警告。';
   if (task.value.state === 'completed') return '沙盒执行完成，结果文件已就绪。';
   if (task.value.state === 'failed') return '任务失败，请查看日志和错误信息。';
   return task.value.message || '任务处理中';
@@ -522,7 +528,9 @@ function connectEvents(id: string) {
   });
 
   source.addEventListener('warning', (message) => {
-    events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
+    const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
+    events.value.unshift(event);
+    if (event.task) task.value = event.task;
     fetchTaskLogs();
   });
 
@@ -1110,6 +1118,7 @@ button:disabled {
 }
 
 .error-box,
+.warning-box,
 .success-box {
   border-radius: 6px;
   padding: 10px 12px;
@@ -1121,6 +1130,13 @@ button:disabled {
   border: 1px solid #f3b0aa;
   background: #fff1ef;
   color: #8c231a;
+}
+
+.warning-box,
+.success-box.has-warning {
+  border: 1px solid #e0c56b;
+  background: #fff9e6;
+  color: #6d4f00;
 }
 
 .success-box {
