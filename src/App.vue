@@ -6,7 +6,7 @@
           <span class="brand-mark">AW</span>
           <div>
             <h1>AI 表格自动化</h1>
-            <p>本地沙盒执行，模型只接收元数据与样本。</p>
+            <p>本地沙盒执行，模型可按需读取和搜索表格。</p>
           </div>
         </div>
 
@@ -73,7 +73,7 @@
 
         <section v-if="!task" class="empty-state">
           <h2>上传表格后开始任务</h2>
-          <p>系统会提取前 N 行表头/结构信息、合并单元格和用户需求，再交给模型生成 pandas 脚本。</p>
+          <p>系统会提取结构信息，再让模型按需搜索和读取局部行，最后生成 pandas 脚本。</p>
         </section>
 
         <template v-else>
@@ -82,7 +82,7 @@
               <div class="panel-header">
                 <div>
                   <h3>实时日志</h3>
-                  <p class="muted">任务日志会自动刷新，包含模型生成、沙盒执行和错误信息。</p>
+                  <p class="muted">任务日志会自动刷新，包含工具探索、模型生成、沙盒执行和错误信息。</p>
                 </div>
                 <button type="button" @click="fetchTaskLogs">刷新</button>
               </div>
@@ -100,7 +100,7 @@
               </div>
             </article>
 
-            <article class="panel execution-panel" :class="{ 'is-active-agent': task && ['generating_code', 'executing', 'repairing'].includes(task.state) }">
+            <article class="panel execution-panel" :class="{ 'is-active-agent': task && ['exploring_data', 'generating_code', 'executing', 'repairing'].includes(task.state) }">
               <div class="panel-header">
                 <div>
                   <h3>Python 执行窗口</h3>
@@ -292,6 +292,8 @@ type Task = {
   message: string;
   outputReady: boolean;
   executionWarning?: string;
+  agentTrace?: { toolName: string; args: Record<string, unknown>; result?: Record<string, unknown>; at: string }[];
+  agentExplorationSummary?: string;
   createdAt: string;
   updatedAt: string;
   questions?: string[];
@@ -306,6 +308,9 @@ type AgentEvent = {
   answer?: string;
   code?: string;
   error?: string;
+  toolName?: string;
+  args?: Record<string, unknown>;
+  result?: Record<string, unknown>;
   task?: Task;
 };
 
@@ -375,6 +380,7 @@ const statusText: Record<string, string> = {
   uploaded: '文件已上传',
   metadata_ready: '元数据已解析',
   retrieving_rules: '正在召回规则',
+  exploring_data: '正在探索表格',
   needs_clarification: '等待人工确认',
   generating_code: '正在生成代码',
   executing: '正在沙盒执行',
@@ -394,6 +400,7 @@ const terminalStates = new Set(['completed', 'failed', 'needs_clarification']);
 
 const executionMessage = computed(() => {
   if (!task.value) return '等待创建任务';
+  if (task.value.state === 'exploring_data') return '模型正在调用工具搜索表格并读取指定行。';
   if (task.value.state === 'generating_code') return '模型正在生成可执行 Python 代码。';
   if (task.value.state === 'executing') return '沙盒正在运行生成的 Python 脚本。';
   if (task.value.state === 'repairing') return '脚本执行失败，模型正在自修复并重试。';
@@ -402,10 +409,6 @@ const executionMessage = computed(() => {
   if (task.value.state === 'failed') return '任务失败，请查看日志和错误信息。';
   return task.value.message || '任务处理中';
 });
-
-const compactEventsLog = computed(() => events.value
-  .map((event) => `[${formatTime(event.at)}] ${event.state || event.type} ${eventText(event)}`)
-  .join('\n'));
 
 const clarificationQuestions = computed(() => {
   const fromTask = task.value?.questions || [];
@@ -534,6 +537,15 @@ function connectEvents(id: string) {
     fetchTaskLogs();
   });
 
+  ['tool_call', 'tool_result', 'agent_summary'].forEach((eventName) => {
+    source.addEventListener(eventName, (message) => {
+      const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
+      events.value.unshift(event);
+      if (event.task) task.value = event.task;
+      fetchTaskLogs();
+    });
+  });
+
   source.addEventListener('error', (message) => {
     if ((message as MessageEvent).data) {
       events.value.unshift(JSON.parse((message as MessageEvent).data) as AgentEvent);
@@ -609,6 +621,9 @@ function eventText(event: AgentEvent) {
   const questions = event.task?.questions || [];
   if (event.questions?.length) return `${event.message || '需要人工确认'}：${event.questions.join('；')}`;
   if (questions.length) return `${event.message || '需要人工确认'}：${questions.join('；')}`;
+  if (event.type === 'tool_call') return `${event.message || '调用表格工具'} ${event.toolName || ''}`;
+  if (event.type === 'tool_result') return `${event.toolName || '表格工具'} 已返回摘要`;
+  if (event.type === 'agent_summary') return event.message || '数据探索完成';
   return event.message || event.answer || event.code || event.error || '已更新';
 }
 
@@ -980,6 +995,7 @@ button:disabled {
   text-shadow: 0 0 4px rgba(252, 165, 165, 0.3);
 }
 
+.log-state-exploring_data, .log-state-tool_call, .log-state-tool_result, .log-state-agent_summary,
 .log-state-executing, .log-state-generating_code, .log-state-repairing {
   color: #fde047;
   text-shadow: 0 0 4px rgba(253, 224, 71, 0.3);
@@ -1075,6 +1091,7 @@ button:disabled {
 }
 
 .state-executing,
+.state-exploring_data,
 .state-generating_code,
 .state-repairing {
   background: #fff2c9;

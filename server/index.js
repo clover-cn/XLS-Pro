@@ -15,6 +15,8 @@ const DIST_DIR = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT || 3100);
 const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS || 60000);
 const REPAIR_LIMIT = 3;
+const AGENT_TOOL_CALL_LIMIT = 16;
+const EXCEL_TOOL_TIMEOUT_MS = Number(process.env.EXCEL_TOOL_TIMEOUT_MS || 30000);
 
 const tasks = new Map();
 const clients = new Map();
@@ -91,6 +93,9 @@ function appendTaskLog(task, type, payload = {}) {
   }
   if (safePayload.code) {
     safePayload.code = `[python code ${safePayload.code.length} chars]`;
+  }
+  if (safePayload.result) {
+    safePayload.result = summarizeToolResult(safePayload.result);
   }
   const line = JSON.stringify({
     at: new Date().toISOString(),
@@ -349,10 +354,100 @@ function publicTask(task) {
     message: task.message,
     outputReady: Boolean(task.outputPath && fs.existsSync(task.outputPath)),
     executionWarning: task.executionWarning || '',
+    agentTrace: task.agentTrace || [],
+    agentExplorationSummary: task.agentExplorationSummary || '',
     questions: task.questions || [],
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
+}
+
+function summarizeToolArgs(args) {
+  return {
+    sheetName: args.sheetName || '',
+    query: args.query || '',
+    maxResults: args.maxResults || undefined,
+    startRow: args.startRow || undefined,
+    endRow: args.endRow || undefined,
+  };
+}
+
+function summarizeToolResult(result) {
+  const data = result && result.data ? result.data : result;
+  if (!data) return {};
+  if (Array.isArray(data.sheets)) {
+    return {
+      fileKind: data.fileKind,
+      sheetNames: data.sheetNames || [],
+      sheets: data.sheets.map((sheet) => ({
+        sheetName: sheet.sheetName,
+        totalRows: sheet.totalRows,
+        totalColumns: sheet.totalColumns,
+        previewRows: Array.isArray(sheet.rawRows) ? sheet.rawRows.length : 0,
+        mergedCells: Array.isArray(sheet.mergedCells) ? sheet.mergedCells.length : 0,
+      })),
+    };
+  }
+  if (Array.isArray(data.results)) {
+    return {
+      query: data.query,
+      resultCount: data.resultCount,
+      sample: data.results.slice(0, 5),
+    };
+  }
+  if (Array.isArray(data.rows)) {
+    return {
+      sheetName: data.sheetName,
+      startRow: data.startRow,
+      endRow: data.endRow,
+      rowCount: data.rows.length,
+      sample: data.rows.slice(0, 3),
+    };
+  }
+  return data;
+}
+
+function summarizeModelMessages(messages) {
+  return messages.map((message) => ({
+    role: message.role,
+    contentChars: typeof message.content === 'string' ? message.content.length : 0,
+    reasoningChars: typeof message.reasoning_content === 'string' ? message.reasoning_content.length : 0,
+    toolCallId: message.tool_call_id,
+    toolCalls: (message.tool_calls || []).map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.function?.name,
+      argumentChars: toolCall.function?.arguments?.length || 0,
+    })),
+  }));
+}
+
+function summarizeModelRequest(requestBody) {
+  return {
+    model: requestBody.model,
+    temperature: requestBody.temperature,
+    stream: requestBody.stream,
+    toolCount: Array.isArray(requestBody.tools) ? requestBody.tools.length : 0,
+    toolChoice: requestBody.tool_choice || '',
+    messages: summarizeModelMessages(requestBody.messages || []),
+  };
+}
+
+function shouldPassReasoningContent(model) {
+  return /deepseek/i.test(model || '');
+}
+
+function toAssistantHistoryMessage(message, model) {
+  const historyMessage = {
+    role: 'assistant',
+    content: message.content || '',
+  };
+  if (shouldPassReasoningContent(model) && message.reasoning_content) {
+    historyMessage.reasoning_content = message.reasoning_content;
+  }
+  if (message.tool_calls) {
+    historyMessage.tool_calls = message.tool_calls;
+  }
+  return historyMessage;
 }
 
 function needsClarification(task) {
@@ -417,14 +512,17 @@ function validateGeneratedCodeContract(code) {
   }
 }
 
-async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
+async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, options = {}) {
   if (!process.env.OPENAI_API_KEY) return null;
   const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const model = process.env.OPENAI_MODEL || 'gpt-4o';
   const startedAt = Date.now();
-  const requestBody = { model, messages, temperature, stream: true };
-  log('info', 'model_stream_request_started', { ...context, model, baseUrl });
-  log('info', 'model_request_body', { ...context, requestBody });
+  const stream = options.stream !== undefined ? Boolean(options.stream) : true;
+  const requestBody = { model, messages, temperature, stream };
+  if (options.tools) requestBody.tools = options.tools;
+  if (options.toolChoice) requestBody.tool_choice = options.toolChoice;
+  log('info', stream ? 'model_stream_request_started' : 'model_request_started', { ...context, model, baseUrl });
+  log('info', 'model_request_body', { ...context, requestBody: summarizeModelRequest(requestBody) });
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -435,8 +533,41 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
   });
   if (!response.ok) {
     const detail = await response.text();
-    log('error', 'model_stream_request_failed', { ...context, status: response.status, detail: detail.slice(0, 500), responseBody: detail });
+    log('error', stream ? 'model_stream_request_failed' : 'model_request_failed', { ...context, status: response.status, detail: detail.slice(0, 500), responseBody: detail });
     throw new Error(`模型调用失败 ${response.status}: ${detail.slice(0, 500)}`);
+  }
+
+  if (!stream) {
+    const data = await response.json();
+    const message = data.choices && data.choices[0] && data.choices[0].message;
+    log('info', 'model_completed', {
+      ...context,
+      model,
+      durationMs: Date.now() - startedAt,
+      chars: message?.content ? message.content.length : 0,
+      reasoningChars: message?.reasoning_content ? message.reasoning_content.length : 0,
+      toolCalls: (message?.tool_calls || []).map((toolCall) => toolCall.function?.name).filter(Boolean),
+      responseBody: {
+        id: data.id,
+        object: data.object,
+        usage: data.usage,
+        choices: (data.choices || []).map((choice) => ({
+          index: choice.index,
+          finish_reason: choice.finish_reason,
+          message: {
+            role: choice.message?.role,
+            contentChars: choice.message?.content ? choice.message.content.length : 0,
+            reasoningChars: choice.message?.reasoning_content ? choice.message.reasoning_content.length : 0,
+            toolCalls: (choice.message?.tool_calls || []).map((toolCall) => ({
+              id: toolCall.id,
+              name: toolCall.function?.name,
+              argumentChars: toolCall.function?.arguments?.length || 0,
+            })),
+          },
+        })),
+      },
+    });
+    return options.returnMessage ? message : (message?.content || '');
   }
 
   const contentType = response.headers.get('content-type') || '';
@@ -448,7 +579,12 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
       model,
       durationMs: Date.now() - startedAt,
       chars: content ? content.length : 0,
-      responseBody: data,
+      responseBody: {
+        id: data.id,
+        object: data.object,
+        usage: data.usage,
+        contentChars: content ? content.length : 0,
+      },
     });
     return content;
   }
@@ -457,6 +593,7 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
   const reader = response.body.getReader();
   let buffer = '';
   let content = '';
+  let reasoningChars = 0;
   let sawFirstChunk = false;
 
   const consumeSseData = (rawData) => {
@@ -464,7 +601,9 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
     try {
       const payload = JSON.parse(rawData);
       const delta = payload.choices && payload.choices[0] && payload.choices[0].delta;
-      const text = delta && (delta.content || delta.reasoning_content || '');
+      const reasoningText = delta && delta.reasoning_content ? delta.reasoning_content : '';
+      const text = delta && delta.content ? delta.content : '';
+      reasoningChars += reasoningText.length;
       if (text) {
         if (!sawFirstChunk) {
           sawFirstChunk = true;
@@ -509,7 +648,8 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}) {
     model,
     durationMs: Date.now() - startedAt,
     chars: content.length,
-    responseBody: content,
+    reasoningChars,
+    responseBody: `[model content ${content.length} chars]`,
   });
   return content;
 }
@@ -518,6 +658,283 @@ function extractCodeBlock(text) {
   if (!text) return '';
   const match = /```(?:python)?\s*([\s\S]*?)```/i.exec(text);
   return match ? match[1].trim() : '';
+}
+
+const EXCEL_AGENT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'excel_describe_workbook',
+      description: '读取当前任务表格的工作簿结构、工作表行列数、前 20 行预览和合并单元格摘要。只读，不返回完整文件。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: {
+            type: 'string',
+            description: '可选。指定工作表名称；省略时描述所有工作表。CSV 文件忽略该字段。',
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_search',
+      description: '在当前任务表格中做大小写不敏感的文本包含搜索，返回命中的工作表、1-based 行号、列号和单元格值。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: '要搜索的文本关键词，不能为空。',
+          },
+          sheetName: {
+            type: 'string',
+            description: '可选。指定工作表名称；省略时搜索整个工作簿。CSV 文件忽略该字段。',
+          },
+          maxResults: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 50,
+            description: '最多返回多少条命中，默认 20，最大 50。',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_read_rows',
+      description: '读取当前任务表格中指定工作表的连续行。行号为 Excel 语义的 1-based 闭区间，单次最多 200 行。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: {
+            type: 'string',
+            description: '可选。指定工作表名称；省略时读取默认工作表。CSV 文件忽略该字段。',
+          },
+          startRow: {
+            type: 'integer',
+            minimum: 1,
+            description: '起始行号，1-based，包含该行。',
+          },
+          endRow: {
+            type: 'integer',
+            minimum: 1,
+            description: '结束行号，1-based，包含该行。',
+          },
+        },
+        required: ['startRow', 'endRow'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+function parseToolArguments(rawArguments) {
+  if (!rawArguments) return {};
+  try {
+    return JSON.parse(rawArguments);
+  } catch (error) {
+    throw new Error(`工具参数不是合法 JSON: ${error.message}`);
+  }
+}
+
+function isFatalExcelToolError(error) {
+  const message = error?.message || String(error || '');
+  return /Unable to create process|spawn .*ENOENT|openpyxl 不可用|Excel 工具输出无法解析/i.test(message);
+}
+
+function toolErrorData(error, toolName) {
+  const message = error?.message || String(error || '工具调用失败');
+  return {
+    ok: false,
+    toolName,
+    error: message,
+    guidance: '这是一次可恢复的工具错误。请根据错误信息调整参数后继续调用工具，例如缩小读取行范围、改用搜索定位行号，或指定正确的工作表名称。',
+  };
+}
+
+function runExcelTool(task, toolName, args) {
+  return new Promise((resolve, reject) => {
+    const allowedTools = new Set(EXCEL_AGENT_TOOLS.map((tool) => tool.function.name));
+    if (!allowedTools.has(toolName)) {
+      reject(new Error(`未知工具: ${toolName}`));
+      return;
+    }
+    const resolvedInput = path.resolve(task.filePath);
+    const resolvedTaskDir = path.resolve(task.dir);
+    if (path.dirname(resolvedInput) !== resolvedTaskDir) {
+      reject(new Error('工具只能读取当前任务目录内的源文件'));
+      return;
+    }
+    const python = process.env.PYTHON_BIN || 'python';
+    const script = path.join(__dirname, 'excel_tools.py');
+    const child = spawn(python, [script, resolvedInput, toolName, JSON.stringify(args || {})], {
+      cwd: task.dir,
+      windowsHide: true,
+      env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), EXCEL_TOOL_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
+      } catch (error) {
+        reject(new Error(`Excel 工具输出无法解析: ${(stderr || stdout || error.message).slice(0, 500)}`));
+        return;
+      }
+      if (code !== 0 || !parsed.ok) {
+        reject(new Error(parsed.error || stderr || `Excel 工具失败，退出码 ${code}`));
+        return;
+      }
+      resolve(parsed);
+    });
+  });
+}
+
+async function exploreDataWithTools(task) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('缺少 OPENAI_API_KEY，无法执行模型工具调用探索');
+  }
+  const model = process.env.OPENAI_MODEL || 'gpt-4o';
+  task.agentTrace = [];
+  const systemPrompt = [
+    '你是一个 Excel 数据探索 Agent。',
+    '你必须通过提供的 Excel 工具按需读取和搜索当前上传表格，不能假设没有读取过的数据。',
+    '工具行号均为 Excel 语义的 1-based 行号。',
+    '优先先了解工作簿结构，再搜索用户需求中的关键词，必要时读取命中行附近的数据。',
+    '不要请求读取整个文件；单次读取要足够小。',
+    '当你认为信息足够生成处理脚本时，停止调用工具，并用中文简要总结你确认的表结构、关键行号、关键字段和后续代码生成依据。',
+  ].join('\n');
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    {
+      role: 'user',
+      content: [
+        '请探索当前上传的 Excel/CSV 文件，为后续生成 pandas 处理脚本收集必要证据。',
+        '',
+        '【用户需求】',
+        task.requirement,
+        '',
+        '【本次特例规则】',
+        task.temporaryRules || '无',
+        '',
+        '【初始元数据】',
+        JSON.stringify(task.metadata),
+        '',
+        '【召回规则】',
+        JSON.stringify(task.retrievedRules || []),
+        '',
+        '探索完成后不要生成代码，只输出探索总结。',
+      ].join('\n'),
+    },
+  ];
+
+  let toolCallCount = 0;
+  for (let round = 0; round <= AGENT_TOOL_CALL_LIMIT; round += 1) {
+    const message = await callOpenAiCompatible(messages, 0, {
+      taskId: task.id,
+      phase: 'explore_data',
+      round,
+    }, {
+      stream: false,
+      tools: EXCEL_AGENT_TOOLS,
+      toolChoice: 'auto',
+      returnMessage: true,
+    });
+    if (!message) throw new Error('模型未返回工具探索消息');
+    const toolCalls = message.tool_calls || [];
+    if (!toolCalls.length) {
+      if (toolCallCount === 0) {
+        throw new Error('模型未调用任何 Excel 工具；请确认当前模型和中转服务支持原生 tools/tool_calls');
+      }
+      const summary = (message.content || '').trim();
+      task.agentExplorationSummary = summary;
+      publish(task, 'agent_summary', {
+        message: summary || '数据探索完成',
+        task: publicTask(task),
+      });
+      return summary;
+    }
+
+    messages.push(toAssistantHistoryMessage(message, model));
+
+    for (const toolCall of toolCalls) {
+      toolCallCount += 1;
+      if (toolCallCount > AGENT_TOOL_CALL_LIMIT) {
+        throw new Error(`模型工具调用超过上限 ${AGENT_TOOL_CALL_LIMIT} 次`);
+      }
+      const toolName = toolCall.function?.name || '';
+      let args = {};
+      let argumentError = null;
+      try {
+        args = parseToolArguments(toolCall.function?.arguments || '{}');
+      } catch (error) {
+        argumentError = error;
+      }
+      const traceItem = {
+        toolName,
+        args: argumentError ? { invalidArguments: true } : summarizeToolArgs(args),
+        at: new Date().toISOString(),
+      };
+      task.agentTrace.push(traceItem);
+      publish(task, 'tool_call', {
+        message: `调用 ${toolName}`,
+        toolName,
+        args: traceItem.args,
+        task: publicTask(task),
+      });
+
+      let toolContent;
+      try {
+        if (argumentError) throw argumentError;
+        const result = await runExcelTool(task, toolName, args);
+        const resultSummary = summarizeToolResult(result);
+        traceItem.result = resultSummary;
+        publish(task, 'tool_result', {
+          message: `${toolName} 已返回摘要`,
+          toolName,
+          result: resultSummary,
+          task: publicTask(task),
+        });
+        toolContent = result.data;
+      } catch (error) {
+        if (isFatalExcelToolError(error)) {
+          throw error;
+        }
+        toolContent = toolErrorData(error, toolName);
+        traceItem.result = summarizeToolResult(toolContent);
+        publish(task, 'tool_result', {
+          message: `${toolName} 调用失败：${toolContent.error}`,
+          toolName,
+          result: toolContent,
+          task: publicTask(task),
+        });
+      }
+      messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        name: toolName,
+        content: JSON.stringify(toolContent),
+      });
+    }
+  }
+  throw new Error(`模型未在 ${AGENT_TOOL_CALL_LIMIT} 次工具调用内完成数据探索`);
 }
 
 async function generateCode(task) {
@@ -564,6 +981,8 @@ async function generateCode(task) {
     `temporary_rules = ${task.temporaryRules || '无'}`,
     `retrieved_rules = ${JSON.stringify(task.retrievedRules)}`,
     `clarifications = ${JSON.stringify(task.clarifications || [])}`,
+    `agent_exploration_summary = ${task.agentExplorationSummary || '无'}`,
+    `agent_tool_trace = ${JSON.stringify(task.agentTrace || [])}`,
   ].join('\n');
   try {
     const modelText = await callOpenAiCompatible([
@@ -596,7 +1015,7 @@ async function repairCode(task, traceback) {
   ].join('\n');
   const modelText = await callOpenAiCompatible([
     { role: 'system', content: repairSystemPrompt },
-    { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}` },
+    { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(task.agentTrace || [])}` },
   ], 0, { taskId: task.id, phase: 'repair_code' });
   const code = extractCodeBlock(modelText);
   if (!code || isSuspiciousGeneratedCode(code)) {
@@ -697,6 +1116,9 @@ async function executeWorkflow(task) {
     setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
     task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
 
+    setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
+    await exploreDataWithTools(task);
+
     const questions = needsClarification(task);
     if (questions.length && !task.clarifications.length) {
       setTaskState(task, 'needs_clarification', '需要人工确认后继续', { questions });
@@ -790,6 +1212,8 @@ async function createTask(req, res) {
     metadata: null,
     retrievedRules: [],
     clarifications: [],
+    agentTrace: [],
+    agentExplorationSummary: '',
     events: [],
     state: 'uploaded',
     message: '文件已上传',
