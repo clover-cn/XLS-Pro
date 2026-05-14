@@ -259,7 +259,7 @@
         </div>
         <div class="trace-drawer-content">
           <div class="agent-traces-list">
-            <details v-for="(trace, index) in task?.agentTrace" :key="index" class="trace-details-box" :open="!trace.result || index === task.agentTrace.length - 1">
+            <details v-for="(trace, index) in task?.agentTrace" :key="index" class="trace-details-box" :open="!trace.result || index === task?.agentTrace?.length! - 1">
               <summary>
                 <div class="summary-left">
                   <span class="status-icon" :class="{ 'is-running': !trace.result, 'is-done': trace.result }">
@@ -641,8 +641,10 @@ async function createTask() {
     currentQuestions.value = [];
     clarificationDismissed.value = false;
     logText.value = '';
-    connectEvents(task.value.id);
-    startPolling(task.value.id);
+    if (task.value) {
+      connectEvents(task.value.id);
+      startPolling(task.value.id);
+    }
     fetchTaskLogs();
   } catch (error) {
     alert(error instanceof Error ? error.message : '任务创建失败');
@@ -663,7 +665,9 @@ async function submitClarification() {
     clarificationAnswer.value = '';
     currentQuestions.value = [];
     clarificationDismissed.value = false;
-    startPolling(task.value.id);
+    if (task.value) {
+      startPolling(task.value.id);
+    }
     fetchTaskLogs();
   }
 }
