@@ -17,7 +17,9 @@ const DIST_DIR = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT || 3100);
 const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS || 60000);
 const REPAIR_LIMIT = 3;
-const AGENT_TOOL_CALL_LIMIT = 16;
+const AGENT_TOOL_CALL_LIMIT = 20;
+const AGENT_TOOL_CALLS_PER_ROUND = 3;
+const AGENT_FORCE_FINAL_REMAINING = 1;
 const EXCEL_TOOL_TIMEOUT_MS = Number(process.env.EXCEL_TOOL_TIMEOUT_MS || 30000);
 const WORKBOOK_INDEX_TIMEOUT_MS = Number(process.env.WORKBOOK_INDEX_TIMEOUT_MS || 10 * 60 * 1000);
 const TASK_CACHE_TTL_MS = Number(process.env.TASK_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
@@ -582,6 +584,229 @@ function summarizeToolResult(result) {
   return data;
 }
 
+function compactText(value, limit = 120) {
+  const text = value === null || value === undefined ? '' : String(value);
+  return text.length <= limit ? text : `${text.slice(0, limit)}...`;
+}
+
+function compactRow(row, maxCells = 40) {
+  const values = Array.isArray(row.values) ? row.values : [];
+  return {
+    rowNumber: row.rowNumber,
+    values: values.slice(0, maxCells).map((value) => compactText(value, 80)),
+    omittedCells: Math.max(0, values.length - maxCells),
+  };
+}
+
+function compactColumn(column) {
+  return {
+    index: column.index,
+    storageName: column.storageName,
+    name: compactText(column.name, 80),
+    type: column.type,
+  };
+}
+
+function compactToolContentForModel(result, toolName) {
+  const data = result && result.data ? result.data : result;
+  if (!data) return {};
+  if (data.ok === false || data.skipped) return data;
+  if (Array.isArray(data.sheets)) {
+    return {
+      toolName,
+      sheetNames: data.sheetNames || [],
+      sheets: data.sheets.map((sheet) => ({
+        sheetName: sheet.sheetName,
+        totalRows: sheet.totalRows,
+        totalColumns: sheet.totalColumns,
+        detectedHeaderRowNumber: sheet.detectedHeaderRowNumber,
+      })),
+    };
+  }
+  if (Array.isArray(data.columns)) {
+    return {
+      toolName,
+      sheetName: data.sheetName,
+      totalRows: data.totalRows,
+      totalColumns: data.totalColumns,
+      detectedHeaderRowNumber: data.detectedHeaderRowNumber,
+      columns: data.columns.slice(0, 40).map(compactColumn),
+      omittedColumns: Math.max(0, data.columns.length - 40),
+      rawRows: (data.rawRows || []).slice(0, 6).map((row) => compactRow(row, 24)),
+    };
+  }
+  if (Array.isArray(data.results)) {
+    return {
+      toolName,
+      query: data.query,
+      resultCount: data.resultCount,
+      results: data.results.slice(0, 10).map((item) => ({
+        sheetName: item.sheetName,
+        rowNumber: item.rowNumber,
+        columnNumber: item.columnNumber,
+        columnName: compactText(item.columnName, 80),
+        value: compactText(item.value, 120),
+      })),
+      omittedResults: Math.max(0, data.results.length - 10),
+    };
+  }
+  if (Array.isArray(data.rows)) {
+    const rowPayload = data.rows.some((row) => Array.isArray(row.values) || row.rowNumber !== undefined);
+    if (!rowPayload) {
+      return {
+        toolName,
+        sheetName: data.sheetName,
+        operation: data.operation,
+        column: data.column,
+        groupBy: data.groupBy,
+        rowCount: data.rows.length,
+        rows: data.rows.slice(0, 50),
+        omittedRows: Math.max(0, data.rows.length - 50),
+      };
+    }
+    return {
+      toolName,
+      sheetName: data.sheetName,
+      startRow: data.startRow,
+      endRow: data.endRow,
+      rowCount: data.rows.length,
+      matchedRows: data.matchedRows,
+      rows: data.rows.slice(0, 5).map((row) => compactRow(row, 40)),
+      omittedRows: Math.max(0, data.rows.length - 5),
+    };
+  }
+  if (Array.isArray(data.topValues)) {
+    return {
+      toolName,
+      sheetName: data.sheetName,
+      column: data.column,
+      totalRows: data.totalRows,
+      nonEmptyRows: data.nonEmptyRows,
+      distinctCount: data.distinctCount,
+      numericCount: data.numericCount,
+      numericMin: data.numericMin,
+      numericMax: data.numericMax,
+      topValues: data.topValues.slice(0, 15).map((item) => ({
+        value: compactText(item.value, 120),
+        count: item.count,
+      })),
+    };
+  }
+  return summarizeToolResult(data);
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizedNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : value;
+}
+
+function normalizeToolArgs(toolName, args = {}) {
+  const sheetName = args.sheetName ? String(args.sheetName).trim() : '';
+  if (toolName === 'excel_list_sheets') return {};
+  if (toolName === 'excel_get_schema') return sheetName ? { sheetName } : {};
+  if (toolName === 'excel_read_rows') {
+    return {
+      sheetName,
+      startRow: normalizedNumber(args.startRow),
+      endRow: normalizedNumber(args.endRow),
+    };
+  }
+  if (toolName === 'excel_sample_rows') {
+    return {
+      sheetName,
+      mode: args.mode || 'first',
+      rowNumber: args.rowNumber === undefined ? undefined : normalizedNumber(args.rowNumber),
+      count: args.count === undefined ? undefined : normalizedNumber(args.count),
+    };
+  }
+  if (toolName === 'excel_search') {
+    return {
+      sheetName,
+      query: compactText(args.query || '', 200),
+      maxResults: args.maxResults === undefined ? undefined : normalizedNumber(args.maxResults),
+    };
+  }
+  if (toolName === 'excel_filter_rows') {
+    return {
+      sheetName,
+      column: args.column ? String(args.column).trim() : '',
+      operator: args.operator || 'contains',
+      value: args.value === undefined ? undefined : compactText(args.value, 200),
+      maxResults: args.maxResults === undefined ? undefined : normalizedNumber(args.maxResults),
+    };
+  }
+  if (toolName === 'excel_aggregate') {
+    return {
+      sheetName,
+      column: args.column ? String(args.column).trim() : '',
+      operation: args.operation || 'sum',
+      groupBy: args.groupBy ? String(args.groupBy).trim() : '',
+    };
+  }
+  if (toolName === 'excel_profile_column') {
+    return {
+      sheetName,
+      column: args.column ? String(args.column).trim() : '',
+    };
+  }
+  return args || {};
+}
+
+function toolCacheKey(toolName, args) {
+  return `${toolName}:${stableStringify(normalizeToolArgs(toolName, args))}`;
+}
+
+function findCachedToolResult(toolCache, toolName, args) {
+  const exact = toolCache.get(toolCacheKey(toolName, args));
+  if (exact) return { ...exact, cacheKind: 'exact' };
+  if (toolName !== 'excel_read_rows') return null;
+  const normalized = normalizeToolArgs(toolName, args);
+  const startRow = Number(normalized.startRow);
+  const endRow = Number(normalized.endRow);
+  if (!Number.isFinite(startRow) || !Number.isFinite(endRow)) return null;
+  for (const entry of toolCache.values()) {
+    if (entry.toolName !== 'excel_read_rows') continue;
+    const cachedArgs = entry.normalizedArgs || {};
+    if ((cachedArgs.sheetName || '') !== (normalized.sheetName || '')) continue;
+    if (Number(cachedArgs.startRow) <= startRow && Number(cachedArgs.endRow) >= endRow) {
+      return { ...entry, cacheKind: 'covered_range' };
+    }
+  }
+  return null;
+}
+
+function toolPriority(toolName, args = {}) {
+  if (toolName === 'excel_list_sheets') return 100;
+  if (toolName === 'excel_get_schema') return 90;
+  if (toolName === 'excel_aggregate' || toolName === 'excel_profile_column') return 80;
+  if (toolName === 'excel_search' || toolName === 'excel_filter_rows') return 70;
+  if (toolName === 'excel_read_rows') return 50;
+  if (toolName === 'excel_sample_rows' && args.mode === 'random') return 10;
+  if (toolName === 'excel_sample_rows') return 40;
+  return 0;
+}
+
+function budgetSkippedToolContent(toolName, reason, remainingBudget) {
+  return {
+    ok: false,
+    skipped: true,
+    toolName,
+    reason,
+    remainingToolBudget: Math.max(0, remainingBudget),
+    guidance: remainingBudget <= 0
+      ? '工具总预算已耗尽。请立即基于已有证据输出规定 JSON，不要继续请求工具。'
+      : '本轮只执行最高价值工具。请基于已有证据判断，下一轮如必须调用工具，只请求一个最关键工具。',
+  };
+}
+
 function summarizeModelMessages(messages) {
   return messages.map((message) => ({
     role: message.role,
@@ -625,7 +850,15 @@ function toAssistantHistoryMessage(message, model) {
   return historyMessage;
 }
 
+function requiresAccountingClarification(requirement) {
+  const text = String(requirement || '');
+  const asksTableIdentity = /是什么表|什么表|有什么用|用途|表格用途|结构概览|整体概览|识别.*表/i.test(text);
+  const asksStructuredCalculation = /计算|统计|求和|汇总|合计|总计|金额|收入|支出|借方|贷方|交易|流水|账|账单|往来|应收|应付|日期|时间|按月|按日|分类|筛选|多少|占比|比例/i.test(text);
+  return asksStructuredCalculation && !asksTableIdentity;
+}
+
 function needsClarification(task) {
+  if (!requiresAccountingClarification(task.requirement)) return [];
   const headers = [
     ...task.metadata.columns.map((column) => column.name),
     ...(task.metadata.rawRows || []).flatMap((row) => row.values || []),
@@ -1220,18 +1453,70 @@ function runExcelTool(task, toolName, args) {
   });
 }
 
+function applyAgentPlan(task, plan) {
+  task.agentPlan = plan;
+  task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
+  publish(task, 'agent_summary', {
+    message: task.agentExplorationSummary || '数据探索完成',
+    plan,
+    task: publicTask(task),
+  });
+  if (plan.status === 'needs_clarification' && Array.isArray(plan.questions) && plan.questions.length) {
+    task.questions = plan.questions;
+  }
+  return task.agentExplorationSummary;
+}
+
+async function requestFinalExplorationJson(task, messages, model, round, reason) {
+  messages.push({
+    role: 'user',
+    content: [
+      reason,
+      `当前 Excel 工具预算上限为 ${AGENT_TOOL_CALL_LIMIT} 次，已进入收敛阶段。`,
+      '现在禁止继续调用工具。请只基于已有工具结果输出规定 JSON 对象，不要输出 Markdown，不要生成代码。',
+    ].join('\n'),
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const message = await callOpenAiCompatible(messages, 0, {
+      taskId: task.id,
+      phase: 'explore_data_final',
+      round,
+      attempt,
+    }, {
+      stream: false,
+      returnMessage: true,
+    });
+    if (!message) throw new Error('模型未返回工具探索总结');
+    const plan = extractJsonObject(message.content || '');
+    if (plan && plan.status && Array.isArray(plan.evidence)) {
+      return applyAgentPlan(task, plan);
+    }
+    messages.push(toAssistantHistoryMessage(message, model));
+    messages.push({
+      role: 'user',
+      content: '上一次回复不是合法 JSON，或缺少 status/evidence。不要调用工具，只输出规定 JSON 对象。',
+    });
+  }
+  throw new Error('模型未能在工具预算内输出合法探索 JSON');
+}
+
 async function exploreDataWithTools(task) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('缺少 OPENAI_API_KEY，无法执行模型工具调用探索');
   }
   const model = process.env.OPENAI_MODEL || 'gpt-4o';
   task.agentTrace = [];
+  const toolCache = new Map();
   const systemPrompt = [
     '你是一个 Excel 数据探索 Agent。',
     '你必须通过提供的索引工具按需查询当前上传表格，不能假设没有查询过的数据。',
     '工具行号均为 Excel 语义的 1-based 行号；列可以用列名、列号或 c1/c2。',
-    '优先调用 excel_list_sheets 和 excel_get_schema，再用 search/filter/aggregate/profile 定位证据。',
+    `工具总预算最多 ${AGENT_TOOL_CALL_LIMIT} 次；每轮最多请求 ${AGENT_TOOL_CALLS_PER_ROUND} 个工具。`,
+    '先调用 excel_list_sheets 判断相关工作表，只对最相关工作表调用 excel_get_schema，不要一次性扫描所有 sheet schema。',
+    '用 search/filter/aggregate/profile 定位证据；只有需要确认表头或样本时才读取少量行。',
     '不要请求读取整个文件；需要大范围分析时使用 filter、aggregate 或 profile。',
+    '不要重复请求相同工具参数；不要用 random 采样代替明确证据。',
+    '当剩余预算不足或信息足够时，立即停止调用工具，并只输出规定 JSON 对象。',
     '当信息足够时，停止调用工具，并只输出一个 JSON 对象，不要输出 Markdown。',
     'JSON 格式：{"status":"ready|needs_clarification","confidence":0-1,"evidence":[{"tool":"工具名","finding":"发现","rows":[行号]}],"needed_columns":["列名"],"implementation_plan":"后续代码生成依据","questions":["需要用户补充的问题"]}',
   ].join('\n');
@@ -1262,6 +1547,9 @@ async function exploreDataWithTools(task) {
   let toolCallCount = 0;
   for (let round = 0; round <= AGENT_TOOL_CALL_LIMIT; round += 1) {
     assertTaskNotCancelled(task);
+    if (toolCallCount >= AGENT_TOOL_CALL_LIMIT - AGENT_FORCE_FINAL_REMAINING) {
+      return requestFinalExplorationJson(task, messages, model, round, '工具预算即将耗尽。');
+    }
     const message = await callOpenAiCompatible(messages, 0, {
       taskId: task.id,
       phase: 'explore_data',
@@ -1294,28 +1582,12 @@ async function exploreDataWithTools(task) {
         });
         continue;
       }
-      task.agentPlan = plan;
-      task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
-      publish(task, 'agent_summary', {
-        message: task.agentExplorationSummary || '数据探索完成',
-        plan,
-        task: publicTask(task),
-      });
-      if (plan.status === 'needs_clarification' && Array.isArray(plan.questions) && plan.questions.length) {
-        task.questions = plan.questions;
-      }
-      return task.agentExplorationSummary;
+      return applyAgentPlan(task, plan);
     }
 
     messages.push(toAssistantHistoryMessage(message, model));
 
-    for (const toolCall of toolCalls) {
-      assertTaskNotCancelled(task);
-      toolCallCount += 1;
-      if (toolCallCount > AGENT_TOOL_CALL_LIMIT) {
-        throw new Error(`模型工具调用超过上限 ${AGENT_TOOL_CALL_LIMIT} 次`);
-      }
-      const toolName = toolCall.function?.name || '';
+    const parsedToolCalls = toolCalls.map((toolCall, index) => {
       let args = {};
       let argumentError = null;
       try {
@@ -1323,6 +1595,25 @@ async function exploreDataWithTools(task) {
       } catch (error) {
         argumentError = error;
       }
+      const toolName = toolCall.function?.name || '';
+      const cacheHit = argumentError ? null : findCachedToolResult(toolCache, toolName, args);
+      return { toolCall, index, toolName, args, argumentError, cacheHit };
+    });
+    const remainingBeforeRound = AGENT_TOOL_CALL_LIMIT - toolCallCount;
+    const selectedIndexes = new Set(
+      parsedToolCalls
+        .filter((item) => !item.argumentError && !item.cacheHit)
+        .sort((left, right) => {
+          const priorityDelta = toolPriority(right.toolName, right.args) - toolPriority(left.toolName, left.args);
+          return priorityDelta || left.index - right.index;
+        })
+        .slice(0, Math.max(0, Math.min(remainingBeforeRound, AGENT_TOOL_CALLS_PER_ROUND)))
+        .map((item) => item.index),
+    );
+
+    for (const item of parsedToolCalls) {
+      assertTaskNotCancelled(task);
+      const { toolCall, toolName, args, argumentError, cacheHit } = item;
       const traceItem = {
         toolName,
         args: argumentError ? { invalidArguments: true } : summarizeToolArgs(args),
@@ -1339,16 +1630,46 @@ async function exploreDataWithTools(task) {
       let toolContent;
       try {
         if (argumentError) throw argumentError;
-        const result = await runExcelTool(task, toolName, args);
-        const resultSummary = summarizeToolResult(result);
-        traceItem.result = resultSummary;
-        publish(task, 'tool_result', {
-          message: `${toolName} 已返回摘要`,
-          toolName,
-          result: resultSummary,
-          task: publicTask(task),
-        });
-        toolContent = result.data;
+        if (cacheHit) {
+          toolContent = { ...cacheHit.modelContent, cacheHit: true, cacheKind: cacheHit.cacheKind };
+          traceItem.result = { ...cacheHit.resultSummary, cacheHit: cacheHit.cacheKind };
+          publish(task, 'tool_result', {
+            message: `${toolName} 复用缓存摘要`,
+            toolName,
+            result: traceItem.result,
+            task: publicTask(task),
+          });
+        } else if (!selectedIndexes.has(item.index)) {
+          const remainingBudget = AGENT_TOOL_CALL_LIMIT - toolCallCount;
+          const reason = remainingBudget <= 0 ? '工具总预算已用完' : '本轮工具执行名额已用完';
+          toolContent = budgetSkippedToolContent(toolName, reason, remainingBudget);
+          traceItem.result = summarizeToolResult(toolContent);
+          publish(task, 'tool_result', {
+            message: `${toolName} 已跳过：${reason}`,
+            toolName,
+            result: toolContent,
+            task: publicTask(task),
+          });
+        } else {
+          toolCallCount += 1;
+          const result = await runExcelTool(task, toolName, args);
+          const resultSummary = summarizeToolResult(result);
+          const modelContent = compactToolContentForModel(result, toolName);
+          traceItem.result = resultSummary;
+          publish(task, 'tool_result', {
+            message: `${toolName} 已返回摘要`,
+            toolName,
+            result: resultSummary,
+            task: publicTask(task),
+          });
+          toolContent = modelContent;
+          toolCache.set(toolCacheKey(toolName, args), {
+            toolName,
+            normalizedArgs: normalizeToolArgs(toolName, args),
+            resultSummary,
+            modelContent,
+          });
+        }
       } catch (error) {
         if (isFatalExcelToolError(error)) {
           throw error;
@@ -1369,8 +1690,11 @@ async function exploreDataWithTools(task) {
         content: JSON.stringify(toolContent),
       });
     }
+    if (toolCallCount >= AGENT_TOOL_CALL_LIMIT - AGENT_FORCE_FINAL_REMAINING) {
+      return requestFinalExplorationJson(task, messages, model, round + 1, '工具预算即将耗尽。');
+    }
   }
-  throw new Error(`模型未在 ${AGENT_TOOL_CALL_LIMIT} 次工具调用内完成数据探索`);
+  return requestFinalExplorationJson(task, messages, model, AGENT_TOOL_CALL_LIMIT + 1, '已达到探索轮次上限。');
 }
 
 async function generateCode(task) {
@@ -1630,7 +1954,9 @@ async function executeWorkflow(task) {
     await exploreDataWithTools(task);
 
     assertTaskNotCancelled(task);
-    const questions = task.questions && task.questions.length ? task.questions : needsClarification(task);
+    const questions = task.questions && task.questions.length
+      ? task.questions
+      : (task.agentPlan?.status === 'ready' ? [] : needsClarification(task));
     if (questions.length && !task.clarifications.length) {
       setTaskState(task, 'needs_clarification', '需要人工确认后继续', { questions });
       return;
