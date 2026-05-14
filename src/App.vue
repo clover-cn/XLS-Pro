@@ -292,6 +292,10 @@ type Task = {
   message: string;
   outputReady: boolean;
   executionWarning?: string;
+  indexStatus?: string;
+  workbookProfile?: Record<string, unknown> | null;
+  agentPlan?: Record<string, unknown> | null;
+  validationReport?: Record<string, unknown> | null;
   agentTrace?: { toolName: string; args: Record<string, unknown>; result?: Record<string, unknown>; at: string }[];
   agentExplorationSummary?: string;
   createdAt: string;
@@ -311,6 +315,13 @@ type AgentEvent = {
   toolName?: string;
   args?: Record<string, unknown>;
   result?: Record<string, unknown>;
+  profile?: Record<string, unknown>;
+  plan?: Record<string, unknown>;
+  report?: Record<string, unknown>;
+  indexedRows?: number;
+  totalRows?: number | null;
+  percent?: number | null;
+  sheetName?: string;
   task?: Task;
 };
 
@@ -379,6 +390,7 @@ watch(parsedLogLines, async () => {
 const statusText: Record<string, string> = {
   uploaded: '文件已上传',
   metadata_ready: '元数据已解析',
+  indexing: '正在构建索引',
   retrieving_rules: '正在召回规则',
   exploring_data: '正在探索表格',
   needs_clarification: '等待人工确认',
@@ -400,6 +412,7 @@ const terminalStates = new Set(['completed', 'failed', 'needs_clarification']);
 
 const executionMessage = computed(() => {
   if (!task.value) return '等待创建任务';
+  if (task.value.state === 'indexing') return '正在为大型表格构建本地查询索引。';
   if (task.value.state === 'exploring_data') return '模型正在调用工具搜索表格并读取指定行。';
   if (task.value.state === 'generating_code') return '模型正在生成可执行 Python 代码。';
   if (task.value.state === 'executing') return '沙盒正在运行生成的 Python 脚本。';
@@ -537,7 +550,7 @@ function connectEvents(id: string) {
     fetchTaskLogs();
   });
 
-  ['tool_call', 'tool_result', 'agent_summary'].forEach((eventName) => {
+  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'agent_summary', 'validation'].forEach((eventName) => {
     source.addEventListener(eventName, (message) => {
       const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
       events.value.unshift(event);
@@ -621,6 +634,9 @@ function eventText(event: AgentEvent) {
   const questions = event.task?.questions || [];
   if (event.questions?.length) return `${event.message || '需要人工确认'}：${event.questions.join('；')}`;
   if (questions.length) return `${event.message || '需要人工确认'}：${questions.join('；')}`;
+  if (event.type === 'index_progress') return event.message || '正在构建索引';
+  if (event.type === 'index_ready') return event.message || '表格索引构建完成';
+  if (event.type === 'validation') return event.message || '输出文件校验完成';
   if (event.type === 'tool_call') return `${event.message || '调用表格工具'} ${event.toolName || ''}`;
   if (event.type === 'tool_result') return `${event.toolName || '表格工具'} 已返回摘要`;
   if (event.type === 'agent_summary') return event.message || '数据探索完成';
@@ -995,6 +1011,7 @@ button:disabled {
   text-shadow: 0 0 4px rgba(252, 165, 165, 0.3);
 }
 
+.log-state-indexing, .log-state-index_progress, .log-state-index_ready, .log-state-validation,
 .log-state-exploring_data, .log-state-tool_call, .log-state-tool_result, .log-state-agent_summary,
 .log-state-executing, .log-state-generating_code, .log-state-repairing {
   color: #fde047;
@@ -1091,6 +1108,7 @@ button:disabled {
 }
 
 .state-executing,
+.state-indexing,
 .state-exploring_data,
 .state-generating_code,
 .state-repairing {

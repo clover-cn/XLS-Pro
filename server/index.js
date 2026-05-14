@@ -17,6 +17,7 @@ const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS || 60000);
 const REPAIR_LIMIT = 3;
 const AGENT_TOOL_CALL_LIMIT = 16;
 const EXCEL_TOOL_TIMEOUT_MS = Number(process.env.EXCEL_TOOL_TIMEOUT_MS || 30000);
+const WORKBOOK_INDEX_TIMEOUT_MS = Number(process.env.WORKBOOK_INDEX_TIMEOUT_MS || 10 * 60 * 1000);
 
 const tasks = new Map();
 const clients = new Map();
@@ -354,6 +355,10 @@ function publicTask(task) {
     message: task.message,
     outputReady: Boolean(task.outputPath && fs.existsSync(task.outputPath)),
     executionWarning: task.executionWarning || '',
+    indexStatus: task.indexStatus || 'pending',
+    workbookProfile: task.workbookProfile || null,
+    agentPlan: task.agentPlan || null,
+    validationReport: task.validationReport || null,
     agentTrace: task.agentTrace || [],
     agentExplorationSummary: task.agentExplorationSummary || '',
     questions: task.questions || [],
@@ -366,6 +371,11 @@ function summarizeToolArgs(args) {
   return {
     sheetName: args.sheetName || '',
     query: args.query || '',
+    column: args.column || '',
+    groupBy: args.groupBy || '',
+    operation: args.operation || '',
+    mode: args.mode || '',
+    count: args.count || undefined,
     maxResults: args.maxResults || undefined,
     startRow: args.startRow || undefined,
     endRow: args.endRow || undefined,
@@ -388,6 +398,15 @@ function summarizeToolResult(result) {
       })),
     };
   }
+  if (Array.isArray(data.columns)) {
+    return {
+      sheetName: data.sheetName,
+      totalRows: data.totalRows,
+      totalColumns: data.totalColumns,
+      detectedHeaderRowNumber: data.detectedHeaderRowNumber,
+      columns: data.columns.slice(0, 30),
+    };
+  }
   if (Array.isArray(data.results)) {
     return {
       query: data.query,
@@ -401,7 +420,21 @@ function summarizeToolResult(result) {
       startRow: data.startRow,
       endRow: data.endRow,
       rowCount: data.rows.length,
+      matchedRows: data.matchedRows,
       sample: data.rows.slice(0, 3),
+    };
+  }
+  if (Array.isArray(data.topValues)) {
+    return {
+      sheetName: data.sheetName,
+      column: data.column,
+      totalRows: data.totalRows,
+      nonEmptyRows: data.nonEmptyRows,
+      distinctCount: data.distinctCount,
+      numericCount: data.numericCount,
+      numericMin: data.numericMin,
+      numericMax: data.numericMax,
+      topValues: data.topValues.slice(0, 10),
     };
   }
   return data;
@@ -664,44 +697,24 @@ const EXCEL_AGENT_TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'excel_describe_workbook',
-      description: '读取当前任务表格的工作簿结构、工作表行列数、前 20 行预览和合并单元格摘要。只读，不返回完整文件。',
-      parameters: {
-        type: 'object',
-        properties: {
-          sheetName: {
-            type: 'string',
-            description: '可选。指定工作表名称；省略时描述所有工作表。CSV 文件忽略该字段。',
-          },
-        },
-        additionalProperties: false,
-      },
+      name: 'excel_list_sheets',
+      description: '列出当前工作簿的工作表、行数、列数和表头候选。先调用这个工具了解全局结构。',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'excel_search',
-      description: '在当前任务表格中做大小写不敏感的文本包含搜索，返回命中的工作表、1-based 行号、列号和单元格值。',
+      name: 'excel_get_schema',
+      description: '读取指定工作表的列结构、表头候选和前 20 行样本。用于确认列名、列号和表头行。',
       parameters: {
         type: 'object',
         properties: {
-          query: {
-            type: 'string',
-            description: '要搜索的文本关键词，不能为空。',
-          },
           sheetName: {
             type: 'string',
-            description: '可选。指定工作表名称；省略时搜索整个工作簿。CSV 文件忽略该字段。',
-          },
-          maxResults: {
-            type: 'integer',
-            minimum: 1,
-            maximum: 50,
-            description: '最多返回多少条命中，默认 20，最大 50。',
+            description: '可选。指定工作表名称；省略时使用默认工作表。',
           },
         },
-        required: ['query'],
         additionalProperties: false,
       },
     },
@@ -734,6 +747,93 @@ const EXCEL_AGENT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_sample_rows',
+      description: '读取指定工作表的样本行，支持 first、last、around、random。用于快速观察大表局部结构。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: { type: 'string', description: '可选。工作表名称。' },
+          mode: { type: 'string', enum: ['first', 'last', 'around', 'random'], description: '采样方式，默认 first。' },
+          rowNumber: { type: 'integer', minimum: 1, description: 'mode=around 时的中心行号。' },
+          count: { type: 'integer', minimum: 1, maximum: 200, description: '最多读取多少行，默认 20。' },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_search',
+      description: '在索引中做大小写不敏感的文本包含搜索，返回 sheet、1-based 行号、列号、列名和值。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '要搜索的文本关键词，不能为空。' },
+          sheetName: { type: 'string', description: '可选。指定工作表；省略时搜索整个工作簿。' },
+          maxResults: { type: 'integer', minimum: 1, maximum: 50, description: '最多返回多少条命中，默认 20，最大 50。' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_filter_rows',
+      description: '按列过滤行，适合定位大表中的候选记录。column 可用列名、列号或 c1/c2。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: { type: 'string', description: '可选。工作表名称。' },
+          column: { type: 'string', description: '列名、1-based 列号或 cN。' },
+          operator: { type: 'string', enum: ['contains', 'equals', 'not_empty', 'gt', 'gte', 'lt', 'lte'], description: '过滤操作，默认 contains。' },
+          value: { type: 'string', description: '过滤值；not_empty 可省略。' },
+          maxResults: { type: 'integer', minimum: 1, maximum: 200, description: '最多返回多少行，默认 50。' },
+        },
+        required: ['column'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_aggregate',
+      description: '对指定列做 sum/avg/min/max/count，可选按另一列分组。适合先验证金额、数量、分类汇总。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: { type: 'string', description: '可选。工作表名称。' },
+          column: { type: 'string', description: '要聚合的列名、列号或 cN。' },
+          operation: { type: 'string', enum: ['sum', 'avg', 'min', 'max', 'count'], description: '聚合操作，默认 sum。' },
+          groupBy: { type: 'string', description: '可选。分组列名、列号或 cN。' },
+        },
+        required: ['column'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_profile_column',
+      description: '查看指定列的非空数量、去重数量、数值范围和高频值，帮助判断列语义。',
+      parameters: {
+        type: 'object',
+        properties: {
+          sheetName: { type: 'string', description: '可选。工作表名称。' },
+          column: { type: 'string', description: '列名、1-based 列号或 cN。' },
+        },
+        required: ['column'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 function parseToolArguments(rawArguments) {
@@ -747,7 +847,7 @@ function parseToolArguments(rawArguments) {
 
 function isFatalExcelToolError(error) {
   const message = error?.message || String(error || '');
-  return /Unable to create process|spawn .*ENOENT|openpyxl 不可用|Excel 工具输出无法解析/i.test(message);
+  return /Unable to create process|spawn .*ENOENT|duckdb 不可用|openpyxl 不可用|Excel 工具输出无法解析|索引不存在/i.test(message);
 }
 
 function toolErrorData(error, toolName) {
@@ -760,6 +860,125 @@ function toolErrorData(error, toolName) {
   };
 }
 
+function parseDsmlToolCalls(content) {
+  if (!content || !content.includes('DSML') || !content.includes('invoke')) return [];
+  const calls = [];
+  const invokePattern = /<[^>]*invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/[^>]*invoke>/g;
+  let invokeMatch;
+  while ((invokeMatch = invokePattern.exec(content)) !== null) {
+    const args = {};
+    const paramPattern = /<[^>]*parameter\s+name="([^"]+)"(?:\s+string="([^"]+)")?[^>]*>([\s\S]*?)<\/[^>]*parameter>/g;
+    let paramMatch;
+    while ((paramMatch = paramPattern.exec(invokeMatch[2])) !== null) {
+      const rawValue = paramMatch[3].trim();
+      if (paramMatch[2] === 'false' && /^-?\d+(\.\d+)?$/.test(rawValue)) {
+        args[paramMatch[1]] = Number(rawValue);
+      } else {
+        args[paramMatch[1]] = rawValue;
+      }
+    }
+    calls.push({
+      id: `dsml_${crypto.randomUUID()}`,
+      type: 'function',
+      function: {
+        name: invokeMatch[1],
+        arguments: JSON.stringify(args),
+      },
+    });
+  }
+  return calls;
+}
+
+function extractJsonObject(text) {
+  if (!text) return null;
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+  const source = fenced ? fenced[1] : text;
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(source.slice(start, end + 1));
+  } catch (error) {
+    return null;
+  }
+}
+
+function buildWorkbookIndex(task) {
+  return new Promise((resolve, reject) => {
+    const python = process.env.PYTHON_BIN || 'python';
+    const script = path.join(__dirname, 'excel_tools.py');
+    const indexDir = path.join(task.dir, 'index');
+    const child = spawn(python, [script, 'build-index', task.filePath, indexDir], {
+      cwd: task.dir,
+      windowsHide: true,
+      env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+    });
+    let stdout = '';
+    let lineBuffer = '';
+    let stderr = '';
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, WORKBOOK_INDEX_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      lineBuffer += text;
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+          if (event.event === 'index_progress') {
+            const total = Number(event.totalRows || 0);
+            const done = Number(event.indexedRows || 0);
+            const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null;
+            publish(task, 'index_progress', {
+              message: total > 0
+                ? `正在索引 ${event.sheetName || ''}：${done}/${total} 行（${percent}%）`
+                : `正在索引 ${event.sheetName || ''}：已处理 ${done} 行`,
+              sheetName: event.sheetName || '',
+              indexedRows: done,
+              totalRows: total || null,
+              percent,
+              phase: event.phase || '',
+              task: publicTask(task),
+            });
+          }
+        } catch (error) {
+          // Final result is also JSON; it is parsed when the child closes.
+        }
+      }
+    });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`索引构建超时：超过 ${Math.round(WORKBOOK_INDEX_TIMEOUT_MS / 1000)} 秒。请增大 WORKBOOK_INDEX_TIMEOUT_MS，或先拆分超大 Excel 文件。`));
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
+      } catch (error) {
+        reject(new Error(`索引构建输出无法解析: ${(stderr || stdout || error.message).slice(0, 500)}`));
+        return;
+      }
+      if (code !== 0 || !parsed.ok) {
+        reject(new Error(parsed.error || stderr || `索引构建失败，退出码 ${code}`));
+        return;
+      }
+      resolve({ indexDir, manifest: parsed.data });
+    });
+  });
+}
+
 function runExcelTool(task, toolName, args) {
   return new Promise((resolve, reject) => {
     const allowedTools = new Set(EXCEL_AGENT_TOOLS.map((tool) => tool.function.name));
@@ -767,15 +986,15 @@ function runExcelTool(task, toolName, args) {
       reject(new Error(`未知工具: ${toolName}`));
       return;
     }
-    const resolvedInput = path.resolve(task.filePath);
+    const resolvedIndex = path.resolve(task.indexDir || path.join(task.dir, 'index'));
     const resolvedTaskDir = path.resolve(task.dir);
-    if (path.dirname(resolvedInput) !== resolvedTaskDir) {
-      reject(new Error('工具只能读取当前任务目录内的源文件'));
+    if (!resolvedIndex.startsWith(resolvedTaskDir)) {
+      reject(new Error('工具只能读取当前任务目录内的索引'));
       return;
     }
     const python = process.env.PYTHON_BIN || 'python';
     const script = path.join(__dirname, 'excel_tools.py');
-    const child = spawn(python, [script, resolvedInput, toolName, JSON.stringify(args || {})], {
+    const child = spawn(python, [script, 'tool', resolvedIndex, toolName, JSON.stringify(args || {})], {
       cwd: task.dir,
       windowsHide: true,
       env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
@@ -815,11 +1034,12 @@ async function exploreDataWithTools(task) {
   task.agentTrace = [];
   const systemPrompt = [
     '你是一个 Excel 数据探索 Agent。',
-    '你必须通过提供的 Excel 工具按需读取和搜索当前上传表格，不能假设没有读取过的数据。',
-    '工具行号均为 Excel 语义的 1-based 行号。',
-    '优先先了解工作簿结构，再搜索用户需求中的关键词，必要时读取命中行附近的数据。',
-    '不要请求读取整个文件；单次读取要足够小。',
-    '当你认为信息足够生成处理脚本时，停止调用工具，并用中文简要总结你确认的表结构、关键行号、关键字段和后续代码生成依据。',
+    '你必须通过提供的索引工具按需查询当前上传表格，不能假设没有查询过的数据。',
+    '工具行号均为 Excel 语义的 1-based 行号；列可以用列名、列号或 c1/c2。',
+    '优先调用 excel_list_sheets 和 excel_get_schema，再用 search/filter/aggregate/profile 定位证据。',
+    '不要请求读取整个文件；需要大范围分析时使用 filter、aggregate 或 profile。',
+    '当信息足够时，停止调用工具，并只输出一个 JSON 对象，不要输出 Markdown。',
+    'JSON 格式：{"status":"ready|needs_clarification","confidence":0-1,"evidence":[{"tool":"工具名","finding":"发现","rows":[行号]}],"needed_columns":["列名"],"implementation_plan":"后续代码生成依据","questions":["需要用户补充的问题"]}',
   ].join('\n');
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -840,7 +1060,7 @@ async function exploreDataWithTools(task) {
         '【召回规则】',
         JSON.stringify(task.retrievedRules || []),
         '',
-        '探索完成后不要生成代码，只输出探索总结。',
+        '探索完成后不要生成代码，只输出结构化 JSON。',
       ].join('\n'),
     },
   ];
@@ -858,18 +1078,38 @@ async function exploreDataWithTools(task) {
       returnMessage: true,
     });
     if (!message) throw new Error('模型未返回工具探索消息');
-    const toolCalls = message.tool_calls || [];
+    let toolCalls = message.tool_calls || [];
+    if (!toolCalls.length) {
+      toolCalls = parseDsmlToolCalls(message.content || '');
+      if (toolCalls.length) {
+        message.tool_calls = toolCalls;
+        message.content = '';
+      }
+    }
     if (!toolCalls.length) {
       if (toolCallCount === 0) {
         throw new Error('模型未调用任何 Excel 工具；请确认当前模型和中转服务支持原生 tools/tool_calls');
       }
-      const summary = (message.content || '').trim();
-      task.agentExplorationSummary = summary;
+      const plan = extractJsonObject(message.content || '');
+      if (!plan || !plan.status || !Array.isArray(plan.evidence)) {
+        messages.push(toAssistantHistoryMessage(message, model));
+        messages.push({
+          role: 'user',
+          content: '你的探索结论不是合法 JSON，或缺少 status/evidence。请继续必要的工具调用；如果已经足够，请只输出规定 JSON 对象。',
+        });
+        continue;
+      }
+      task.agentPlan = plan;
+      task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
       publish(task, 'agent_summary', {
-        message: summary || '数据探索完成',
+        message: task.agentExplorationSummary || '数据探索完成',
+        plan,
         task: publicTask(task),
       });
-      return summary;
+      if (plan.status === 'needs_clarification' && Array.isArray(plan.questions) && plan.questions.length) {
+        task.questions = plan.questions;
+      }
+      return task.agentExplorationSummary;
     }
 
     messages.push(toAssistantHistoryMessage(message, model));
@@ -977,10 +1217,12 @@ async function generateCode(task) {
     '',
     '【上下文】',
     `metadata_json = ${JSON.stringify(task.metadata)}`,
+    `workbook_profile = ${JSON.stringify(task.workbookProfile || {})}`,
     `user_requirement = ${task.requirement}`,
     `temporary_rules = ${task.temporaryRules || '无'}`,
     `retrieved_rules = ${JSON.stringify(task.retrievedRules)}`,
     `clarifications = ${JSON.stringify(task.clarifications || [])}`,
+    `agent_plan = ${JSON.stringify(task.agentPlan || {})}`,
     `agent_exploration_summary = ${task.agentExplorationSummary || '无'}`,
     `agent_tool_trace = ${JSON.stringify(task.agentTrace || [])}`,
   ].join('\n');
@@ -1015,7 +1257,7 @@ async function repairCode(task, traceback) {
   ].join('\n');
   const modelText = await callOpenAiCompatible([
     { role: 'system', content: repairSystemPrompt },
-    { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nuser_requirement = ${task.requirement}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(task.agentTrace || [])}` },
+    { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nworkbook_profile = ${JSON.stringify(task.workbookProfile || {})}\nuser_requirement = ${task.requirement}\nagent_plan = ${JSON.stringify(task.agentPlan || {})}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(task.agentTrace || [])}` },
   ], 0, { taskId: task.id, phase: 'repair_code' });
   const code = extractCodeBlock(modelText);
   if (!code || isSuspiciousGeneratedCode(code)) {
@@ -1110,16 +1352,56 @@ function runSandbox(task) {
   });
 }
 
+async function validateOutput(task, outputPath) {
+  const report = {
+    ok: false,
+    outputExists: Boolean(outputPath && fs.existsSync(outputPath)),
+    sheets: [],
+    warnings: [],
+  };
+  if (!report.outputExists) {
+    report.warnings.push('输出文件不存在');
+    return report;
+  }
+  try {
+    const metadata = await extractMetadata(outputPath, 'output.xlsx', 10);
+    report.ok = true;
+    report.sheets = (metadata.sheetNames || [metadata.sheetName]).filter(Boolean);
+    report.totalRows = metadata.totalRows;
+    report.totalColumns = metadata.totalColumns;
+    if (!report.sheets.length) report.warnings.push('输出文件没有工作表');
+    if (!metadata.totalRows) report.warnings.push('默认工作表没有数据行');
+  } catch (error) {
+    report.warnings.push(`输出文件校验失败: ${error.message}`);
+  }
+  return report;
+}
+
 async function executeWorkflow(task) {
   try {
     log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
+    if (task.indexStatus !== 'ready') {
+      task.indexStatus = 'indexing';
+      setTaskState(task, 'indexing', '正在构建大型表格索引');
+      publish(task, 'indexing', { message: '正在构建 DuckDB 表格索引', task: publicTask(task) });
+      const indexed = await buildWorkbookIndex(task);
+      task.indexDir = indexed.indexDir;
+      task.workbookProfile = indexed.manifest;
+      task.indexStatus = 'ready';
+      publish(task, 'index_ready', {
+        message: '表格索引构建完成',
+        profile: summarizeToolResult({ sheets: indexed.manifest.sheets }),
+        task: publicTask(task),
+      });
+    }
+
     setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
     task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
 
     setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
     await exploreDataWithTools(task);
 
-    const questions = needsClarification(task);
+    const questions = task.questions && task.questions.length ? task.questions : needsClarification(task);
     if (questions.length && !task.clarifications.length) {
       setTaskState(task, 'needs_clarification', '需要人工确认后继续', { questions });
       return;
@@ -1137,6 +1419,12 @@ async function executeWorkflow(task) {
       if (result.ok) {
         task.outputPath = result.output;
         task.executionWarning = result.warning || '';
+        task.validationReport = await validateOutput(task, result.output);
+        publish(task, 'validation', {
+          message: task.validationReport.ok ? '输出文件校验完成' : '输出文件校验发现问题',
+          report: task.validationReport,
+          task: publicTask(task),
+        });
         if (task.executionWarning) {
           publish(task, 'warning', {
             message: `结果文件已生成，但执行过程中出现警告：${task.executionWarning}`,
@@ -1163,6 +1451,7 @@ async function executeWorkflow(task) {
     }
     setTaskState(task, 'failed', lastError || '沙盒执行失败');
   } catch (error) {
+    if (task.state === 'indexing') task.indexStatus = 'failed';
     log('error', 'workflow_failed', { taskId: task.id, error: error.message });
     setTaskState(task, 'failed', error.message);
   }
@@ -1212,6 +1501,11 @@ async function createTask(req, res) {
     metadata: null,
     retrievedRules: [],
     clarifications: [],
+    indexStatus: 'pending',
+    indexDir: '',
+    workbookProfile: null,
+    agentPlan: null,
+    validationReport: null,
     agentTrace: [],
     agentExplorationSummary: '',
     events: [],
