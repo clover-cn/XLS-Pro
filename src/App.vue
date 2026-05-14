@@ -213,16 +213,7 @@
             </p>
           </section>
 
-          <section class="timeline">
-            <h3>任务事件</h3>
-            <ol>
-              <li v-for="(event, index) in events" :key="`${event.at}-${index}`">
-                <span>{{ formatTime(event.at) }}</span>
-                <strong>{{ event.state || event.type }}</strong>
-                <p>{{ eventText(event) }}</p>
-              </li>
-            </ol>
-          </section>
+
         </template>
       </section>
     </section>
@@ -690,18 +681,6 @@ function formatTime(value: string) {
   }).format(new Date(value));
 }
 
-function eventText(event: AgentEvent) {
-  const questions = event.task?.questions || [];
-  if (event.questions?.length) return `${event.message || '需要人工确认'}：${event.questions.join('；')}`;
-  if (questions.length) return `${event.message || '需要人工确认'}：${questions.join('；')}`;
-  if (event.type === 'index_progress') return event.message || '正在构建索引';
-  if (event.type === 'index_ready') return event.message || '表格索引构建完成';
-  if (event.type === 'validation') return event.message || '输出文件校验完成';
-  if (event.type === 'tool_call') return `${event.message || '调用表格工具'} ${event.toolName || ''}`;
-  if (event.type === 'tool_result') return `${event.toolName || '表格工具'} 已返回摘要`;
-  if (event.type === 'agent_summary') return event.message || '数据探索完成';
-  return event.message || event.answer || event.code || event.error || '已更新';
-}
 
 onMounted(loadRules);
 
@@ -946,7 +925,6 @@ button:disabled {
 
 .empty-state,
 .panel,
-.timeline,
 .code-panel {
   background: #ffffff;
   border: 1px solid #d9dfd7;
@@ -1308,32 +1286,6 @@ th {
   top: 0;
 }
 
-.timeline ol {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.timeline li {
-  display: grid;
-  grid-template-columns: 86px 150px minmax(0, 1fr);
-  gap: 12px;
-  border-bottom: 1px solid #e6ebe4;
-  padding-bottom: 10px;
-}
-
-.timeline span {
-  color: #64736a;
-}
-
-.timeline p {
-  margin: 0;
-  overflow-wrap: anywhere;
-}
-
 .code-panel pre {
   margin: 0;
   max-height: 420px;
@@ -1383,8 +1335,7 @@ th {
     border-bottom: 1px solid #d9dfd7;
   }
 
-  .status-bar,
-  .timeline li {
+  .status-bar {
     grid-template-columns: 1fr;
     align-items: flex-start;
   }
