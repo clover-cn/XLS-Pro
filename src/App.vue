@@ -66,6 +66,9 @@
             <h2>{{ statusLabel }}</h2>
           </div>
           <div class="status-actions">
+            <button v-if="canCancelTask" type="button" class="danger-button" :disabled="isCancelling" @click="cancelTask">
+              {{ isCancelling ? '停止中' : '停止任务' }}
+            </button>
             <a v-if="task?.outputReady" class="download-link" :href="downloadUrl">下载结果</a>
             <a v-if="task" class="download-link" :href="`/api/tasks/${task.id}/logs`" target="_blank" rel="noreferrer">查看日志</a>
           </div>
@@ -325,6 +328,7 @@ type KnowledgeRule = {
 type Task = {
   id: string;
   filename: string;
+  fileHash?: string;
   requirement: string;
   temporaryRules: string;
   previewRows?: number;
@@ -337,6 +341,7 @@ type Task = {
   outputReady: boolean;
   executionWarning?: string;
   indexStatus?: string;
+  indexReused?: boolean;
   workbookProfile?: Record<string, unknown> | null;
   agentPlan?: Record<string, unknown> | null;
   validationReport?: Record<string, unknown> | null;
@@ -380,6 +385,7 @@ const task = ref<Task | null>(null);
 const events = ref<AgentEvent[]>([]);
 const logText = ref('');
 const isSubmitting = ref(false);
+const isCancelling = ref(false);
 const eventSource = ref<EventSource | null>(null);
 const currentQuestions = ref<string[]>([]);
 const clarificationDismissed = ref(false);
@@ -450,6 +456,7 @@ const statusText: Record<string, string> = {
   repairing: '正在自修复',
   completed: '处理完成',
   failed: '处理失败',
+  cancelled: '已停止',
 };
 
 const statusLabel = computed(() => {
@@ -459,7 +466,10 @@ const statusLabel = computed(() => {
 
 const downloadUrl = computed(() => (task.value ? `/api/tasks/${task.value.id}/output` : '#'));
 
-const terminalStates = new Set(['completed', 'failed', 'needs_clarification']);
+const terminalStates = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
+const cancellableStates = new Set(['uploaded', 'metadata_ready', 'indexing', 'retrieving_rules', 'exploring_data', 'generating_code', 'executing', 'repairing', 'needs_clarification']);
+
+const canCancelTask = computed(() => Boolean(task.value && cancellableStates.has(task.value.state)));
 
 const executionMessage = computed(() => {
   if (!task.value) return '等待创建任务';
@@ -471,6 +481,7 @@ const executionMessage = computed(() => {
   if (task.value.state === 'completed' && task.value.executionWarning) return '结果文件已生成，执行过程中存在警告。';
   if (task.value.state === 'completed') return '沙盒执行完成，结果文件已就绪。';
   if (task.value.state === 'failed') return '任务失败，请查看日志和错误信息。';
+  if (task.value.state === 'cancelled') return '任务已停止，不会继续调用模型、索引工具或沙盒。';
   return task.value.message || '任务处理中';
 });
 
@@ -581,7 +592,7 @@ function connectEvents(id: string) {
     if (event.task) task.value = event.task;
     if (event.task?.questions?.length) currentQuestions.value = event.task.questions;
     if (event.state !== 'needs_clarification') clarificationDismissed.value = false;
-    if (event.state === 'completed' || event.state === 'failed') {
+    if (event.state === 'completed' || event.state === 'failed' || event.state === 'cancelled') {
       refreshTask(id);
     }
     fetchTaskLogs();
@@ -650,6 +661,26 @@ async function createTask() {
     alert(error instanceof Error ? error.message : '任务创建失败');
   } finally {
     isSubmitting.value = false;
+  }
+}
+
+async function cancelTask() {
+  if (!task.value || isCancelling.value) return;
+  if (!confirm('确定要停止当前任务吗？')) return;
+  isCancelling.value = true;
+  try {
+    const response = await fetch(`/api/tasks/${task.value.id}/cancel`, { method: 'POST' });
+    if (!response.ok) {
+      const payload = await response.json();
+      throw new Error(payload.error || '停止任务失败');
+    }
+    task.value = await response.json();
+    stopPolling();
+    fetchTaskLogs();
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '停止任务失败');
+  } finally {
+    isCancelling.value = false;
   }
 }
 

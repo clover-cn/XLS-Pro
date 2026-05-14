@@ -10,6 +10,8 @@ loadEnvFile(path.join(ROOT, '.env'));
 const DATA_DIR = path.join(ROOT, 'data');
 const RULES_FILE = path.join(DATA_DIR, 'rules.json');
 const TASK_DIR = resolveProjectPath(process.env.TASK_STORAGE_DIR || '.agentic-tasks');
+const FILES_DIR = path.join(TASK_DIR, 'files');
+const TASKS_DIR = path.join(TASK_DIR, 'tasks');
 const LOG_FILE = path.join(TASK_DIR, 'server-runtime.log');
 const DIST_DIR = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT || 3100);
@@ -18,19 +20,37 @@ const REPAIR_LIMIT = 3;
 const AGENT_TOOL_CALL_LIMIT = 16;
 const EXCEL_TOOL_TIMEOUT_MS = Number(process.env.EXCEL_TOOL_TIMEOUT_MS || 30000);
 const WORKBOOK_INDEX_TIMEOUT_MS = Number(process.env.WORKBOOK_INDEX_TIMEOUT_MS || 10 * 60 * 1000);
+const TASK_CACHE_TTL_MS = Number(process.env.TASK_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+const TERMINAL_STATES = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
+const ACTIVE_STATES = new Set([
+  'uploaded',
+  'metadata_ready',
+  'indexing',
+  'retrieving_rules',
+  'exploring_data',
+  'generating_code',
+  'executing',
+  'repairing',
+]);
 
 const tasks = new Map();
 const clients = new Map();
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(TASK_DIR, { recursive: true });
+fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(TASKS_DIR, { recursive: true });
 log('info', 'server_configured', {
   port: PORT,
   taskDir: TASK_DIR,
+  filesDir: FILES_DIR,
+  tasksDir: TASKS_DIR,
+  cacheTtlHours: Math.round(TASK_CACHE_TTL_MS / 3600000),
   model: process.env.OPENAI_MODEL || '',
   hasApiKey: Boolean(process.env.OPENAI_API_KEY),
   pythonBin: process.env.PYTHON_BIN || 'python',
 });
+cleanupOldTaskCache();
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -79,6 +99,72 @@ function resetRuntimeLog(reason, context = {}) {
     console.error('log_reset_failed', error.message);
   }
   log('info', 'runtime_log_reset', { reason, ...context });
+}
+
+function isPathInside(parent, candidate) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === '' || (relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function directorySize(targetPath) {
+  if (!fs.existsSync(targetPath)) return 0;
+  const stat = fs.statSync(targetPath);
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+  return fs.readdirSync(targetPath).reduce((total, entry) => total + directorySize(path.join(targetPath, entry)), 0);
+}
+
+function removeTaskCachePath(targetPath) {
+  const resolved = path.resolve(targetPath);
+  if (resolved === path.resolve(TASK_DIR) || !isPathInside(TASK_DIR, resolved)) {
+    throw new Error(`拒绝删除任务缓存目录外路径: ${targetPath}`);
+  }
+  const bytes = directorySize(resolved);
+  fs.rmSync(resolved, { recursive: true, force: true });
+  return bytes;
+}
+
+function touchIfExists(targetPath) {
+  if (!fs.existsSync(targetPath)) return;
+  const now = new Date();
+  fs.utimesSync(targetPath, now, now);
+}
+
+function removeStaleChildren(baseDir, cutoffMs, protectedNames = new Set()) {
+  if (!fs.existsSync(baseDir)) return { removed: 0, freedBytes: 0 };
+  let removed = 0;
+  let freedBytes = 0;
+  for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+    if (protectedNames.has(entry.name)) continue;
+    const fullPath = path.join(baseDir, entry.name);
+    const stat = fs.statSync(fullPath);
+    if (stat.mtimeMs >= cutoffMs) continue;
+    freedBytes += removeTaskCachePath(fullPath);
+    removed += 1;
+  }
+  return { removed, freedBytes };
+}
+
+function cleanupOldTaskCache() {
+  try {
+    fs.mkdirSync(FILES_DIR, { recursive: true });
+    fs.mkdirSync(TASKS_DIR, { recursive: true });
+    const cutoffMs = Date.now() - TASK_CACHE_TTL_MS;
+    const protectedRootNames = new Set(['files', 'tasks', path.basename(LOG_FILE)]);
+    const files = removeStaleChildren(FILES_DIR, cutoffMs);
+    const taskRuns = removeStaleChildren(TASKS_DIR, cutoffMs);
+    const legacy = removeStaleChildren(TASK_DIR, cutoffMs, protectedRootNames);
+    log('info', 'task_cache_cleanup_finished', {
+      ttlHours: Math.round(TASK_CACHE_TTL_MS / 3600000),
+      removed: files.removed + taskRuns.removed + legacy.removed,
+      freedBytes: files.freedBytes + taskRuns.freedBytes + legacy.freedBytes,
+      filesRemoved: files.removed,
+      taskRunsRemoved: taskRuns.removed,
+      legacyRemoved: legacy.removed,
+    });
+  } catch (error) {
+    log('warn', 'task_cache_cleanup_failed', { error: error.message });
+  }
 }
 
 function appendTaskLog(task, type, payload = {}) {
@@ -344,6 +430,7 @@ function publicTask(task) {
   return {
     id: task.id,
     filename: task.filename,
+    fileHash: task.fileHash || '',
     requirement: task.requirement,
     temporaryRules: task.temporaryRules,
     previewRows: task.previewRows,
@@ -357,6 +444,7 @@ function publicTask(task) {
     executionWarning: task.executionWarning || '',
     indexStatus: task.indexStatus || 'pending',
     workbookProfile: task.workbookProfile || null,
+    indexReused: Boolean(task.indexReused),
     agentPlan: task.agentPlan || null,
     validationReport: task.validationReport || null,
     agentTrace: task.agentTrace || [],
@@ -365,6 +453,60 @@ function publicTask(task) {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
+}
+
+function cancelledError(message = '任务已手动停止') {
+  const error = new Error(message);
+  error.code = 'TASK_CANCELLED';
+  return error;
+}
+
+function isCancelledError(error) {
+  return error?.code === 'TASK_CANCELLED' || /任务已手动停止|This operation was aborted/i.test(error?.message || '');
+}
+
+function assertTaskNotCancelled(task) {
+  if (task?.cancelRequested || task?.state === 'cancelled') {
+    throw cancelledError();
+  }
+}
+
+function trackChildProcess(task, child, label) {
+  if (!task.children) task.children = new Set();
+  child.taskProcessLabel = label;
+  task.children.add(child);
+  const untrack = () => task.children?.delete(child);
+  child.once('close', untrack);
+  child.once('error', untrack);
+  if (task.cancelRequested) {
+    child.kill('SIGKILL');
+  }
+  return child;
+}
+
+function cancelTask(task, message = '已手动停止') {
+  if (!task) return false;
+  if (task.state === 'cancelled') return true;
+  if (task.state === 'completed' || task.state === 'failed') return true;
+  if (!ACTIVE_STATES.has(task.state) && task.state !== 'needs_clarification') return false;
+  task.cancelRequested = true;
+  if (task.abortController) {
+    try {
+      task.abortController.abort();
+    } catch (error) {
+      log('warn', 'task_abort_controller_failed', { taskId: task.id, error: error.message });
+    }
+  }
+  for (const child of task.children || []) {
+    try {
+      child.kill('SIGKILL');
+    } catch (error) {
+      log('warn', 'task_child_kill_failed', { taskId: task.id, label: child.taskProcessLabel || '', error: error.message });
+    }
+  }
+  setTaskState(task, 'cancelled', message);
+  log('info', 'task_cancelled', { taskId: task.id });
+  return true;
 }
 
 function summarizeToolArgs(args) {
@@ -547,6 +689,8 @@ function validateGeneratedCodeContract(code) {
 
 async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, options = {}) {
   if (!process.env.OPENAI_API_KEY) return null;
+  const ownerTask = context.taskId ? tasks.get(context.taskId) : null;
+  assertTaskNotCancelled(ownerTask);
   const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
   const model = process.env.OPENAI_MODEL || 'gpt-4o';
   const startedAt = Date.now();
@@ -554,19 +698,31 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, o
   const requestBody = { model, messages, temperature, stream };
   if (options.tools) requestBody.tools = options.tools;
   if (options.toolChoice) requestBody.tool_choice = options.toolChoice;
+  const controller = new AbortController();
+  if (ownerTask) ownerTask.abortController = controller;
   log('info', stream ? 'model_stream_request_started' : 'model_request_started', { ...context, model, baseUrl });
   log('info', 'model_request_body', { ...context, requestBody: summarizeModelRequest(requestBody) });
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify(requestBody),
-  });
+  let response;
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (ownerTask?.abortController === controller) ownerTask.abortController = null;
+    if (ownerTask?.cancelRequested || error.name === 'AbortError') throw cancelledError();
+    throw error;
+  }
+  assertTaskNotCancelled(ownerTask);
   if (!response.ok) {
     const detail = await response.text();
     log('error', stream ? 'model_stream_request_failed' : 'model_request_failed', { ...context, status: response.status, detail: detail.slice(0, 500), responseBody: detail });
+    if (ownerTask?.abortController === controller) ownerTask.abortController = null;
     throw new Error(`模型调用失败 ${response.status}: ${detail.slice(0, 500)}`);
   }
 
@@ -600,6 +756,7 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, o
         })),
       },
     });
+    if (ownerTask?.abortController === controller) ownerTask.abortController = null;
     return options.returnMessage ? message : (message?.content || '');
   }
 
@@ -619,6 +776,7 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, o
         contentChars: content ? content.length : 0,
       },
     });
+    if (ownerTask?.abortController === controller) ownerTask.abortController = null;
     return content;
   }
 
@@ -654,8 +812,17 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, o
   };
 
   while (true) {
-    const { value, done } = await reader.read();
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (error) {
+      if (ownerTask?.abortController === controller) ownerTask.abortController = null;
+      if (ownerTask?.cancelRequested || error.name === 'AbortError') throw cancelledError();
+      throw error;
+    }
+    const { value, done } = chunk;
     if (done) break;
+    assertTaskNotCancelled(ownerTask);
     buffer += decoder.decode(value, { stream: true });
     const frames = buffer.split(/\r?\n\r?\n/);
     buffer = frames.pop() || '';
@@ -684,6 +851,7 @@ async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, o
     reasoningChars,
     responseBody: `[model content ${content.length} chars]`,
   });
+  if (ownerTask?.abortController === controller) ownerTask.abortController = null;
   return content;
 }
 
@@ -905,14 +1073,22 @@ function extractJsonObject(text) {
 
 function buildWorkbookIndex(task) {
   return new Promise((resolve, reject) => {
+    try {
+      assertTaskNotCancelled(task);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const python = process.env.PYTHON_BIN || 'python';
     const script = path.join(__dirname, 'excel_tools.py');
-    const indexDir = path.join(task.dir, 'index');
+    const indexDir = task.indexDir || path.join(task.dir, 'index');
+    fs.mkdirSync(indexDir, { recursive: true });
     const child = spawn(python, [script, 'build-index', task.filePath, indexDir], {
       cwd: task.dir,
       windowsHide: true,
       env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
+    trackChildProcess(task, child, 'build-index');
     let stdout = '';
     let lineBuffer = '';
     let stderr = '';
@@ -922,6 +1098,10 @@ function buildWorkbookIndex(task) {
       child.kill('SIGKILL');
     }, WORKBOOK_INDEX_TIMEOUT_MS);
     child.stdout.on('data', (chunk) => {
+      if (task.cancelRequested) {
+        child.kill('SIGKILL');
+        return;
+      }
       const text = chunk.toString();
       stdout += text;
       lineBuffer += text;
@@ -959,6 +1139,10 @@ function buildWorkbookIndex(task) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (task.cancelRequested) {
+        reject(cancelledError());
+        return;
+      }
       if (timedOut) {
         reject(new Error(`索引构建超时：超过 ${Math.round(WORKBOOK_INDEX_TIMEOUT_MS / 1000)} 秒。请增大 WORKBOOK_INDEX_TIMEOUT_MS，或先拆分超大 Excel 文件。`));
         return;
@@ -981,15 +1165,20 @@ function buildWorkbookIndex(task) {
 
 function runExcelTool(task, toolName, args) {
   return new Promise((resolve, reject) => {
+    try {
+      assertTaskNotCancelled(task);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     const allowedTools = new Set(EXCEL_AGENT_TOOLS.map((tool) => tool.function.name));
     if (!allowedTools.has(toolName)) {
       reject(new Error(`未知工具: ${toolName}`));
       return;
     }
     const resolvedIndex = path.resolve(task.indexDir || path.join(task.dir, 'index'));
-    const resolvedTaskDir = path.resolve(task.dir);
-    if (!resolvedIndex.startsWith(resolvedTaskDir)) {
-      reject(new Error('工具只能读取当前任务目录内的索引'));
+    if (!isPathInside(TASK_DIR, resolvedIndex)) {
+      reject(new Error('工具只能读取任务缓存目录内的索引'));
       return;
     }
     const python = process.env.PYTHON_BIN || 'python';
@@ -999,6 +1188,7 @@ function runExcelTool(task, toolName, args) {
       windowsHide: true,
       env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
+    trackChildProcess(task, child, `excel-tool:${toolName}`);
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), EXCEL_TOOL_TIMEOUT_MS);
@@ -1010,6 +1200,10 @@ function runExcelTool(task, toolName, args) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (task.cancelRequested) {
+        reject(cancelledError());
+        return;
+      }
       let parsed;
       try {
         parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
@@ -1067,6 +1261,7 @@ async function exploreDataWithTools(task) {
 
   let toolCallCount = 0;
   for (let round = 0; round <= AGENT_TOOL_CALL_LIMIT; round += 1) {
+    assertTaskNotCancelled(task);
     const message = await callOpenAiCompatible(messages, 0, {
       taskId: task.id,
       phase: 'explore_data',
@@ -1088,7 +1283,7 @@ async function exploreDataWithTools(task) {
     }
     if (!toolCalls.length) {
       if (toolCallCount === 0) {
-        throw new Error('模型未调用任何 Excel 工具；请确认当前模型和中转服务支持原生 tools/tool_calls');
+        throw new Error('模型未调用任何 Excel 工具；请确认当前模型和中转服务支持原生 tools/tool_calls，请再次运行重试。');
       }
       const plan = extractJsonObject(message.content || '');
       if (!plan || !plan.status || !Array.isArray(plan.evidence)) {
@@ -1115,6 +1310,7 @@ async function exploreDataWithTools(task) {
     messages.push(toAssistantHistoryMessage(message, model));
 
     for (const toolCall of toolCalls) {
+      assertTaskNotCancelled(task);
       toolCallCount += 1;
       if (toolCallCount > AGENT_TOOL_CALL_LIMIT) {
         throw new Error(`模型工具调用超过上限 ${AGENT_TOOL_CALL_LIMIT} 次`);
@@ -1276,6 +1472,12 @@ function writeGeneratedCode(task, code) {
 
 function runSandbox(task) {
   return new Promise((resolve) => {
+    try {
+      assertTaskNotCancelled(task);
+    } catch (error) {
+      resolve({ ok: false, cancelled: true, error: error.message });
+      return;
+    }
     const python = process.env.PYTHON_BIN || 'python';
     const runner = path.join(__dirname, 'sandbox', 'runner.py');
     const script = path.join(task.dir, 'generated.py');
@@ -1293,6 +1495,7 @@ function runSandbox(task) {
       windowsHide: true,
       env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
+    trackChildProcess(task, child, 'sandbox');
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), SANDBOX_TIMEOUT_MS + 1000);
@@ -1305,6 +1508,10 @@ function runSandbox(task) {
     });
     child.on('close', () => {
       clearTimeout(timer);
+      if (task.cancelRequested) {
+        resolve({ ok: false, cancelled: true, error: '任务已手动停止' });
+        return;
+      }
       try {
         const parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
         log(parsed.ok ? 'info' : 'error', 'sandbox_finished', {
@@ -1379,34 +1586,57 @@ async function validateOutput(task, outputPath) {
 
 async function executeWorkflow(task) {
   try {
+    assertTaskNotCancelled(task);
     log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
     if (task.indexStatus !== 'ready') {
-      task.indexStatus = 'indexing';
-      setTaskState(task, 'indexing', '正在构建大型表格索引');
-      publish(task, 'indexing', { message: '正在构建 DuckDB 表格索引', task: publicTask(task) });
-      const indexed = await buildWorkbookIndex(task);
-      task.indexDir = indexed.indexDir;
-      task.workbookProfile = indexed.manifest;
-      task.indexStatus = 'ready';
-      publish(task, 'index_ready', {
-        message: '表格索引构建完成',
-        profile: summarizeToolResult({ sheets: indexed.manifest.sheets }),
-        task: publicTask(task),
-      });
+      const manifestPath = path.join(task.indexDir || path.join(task.dir, 'index'), 'manifest.json');
+      if (fs.existsSync(manifestPath)) {
+        task.workbookProfile = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        touchIfExists(task.fileCacheDir);
+        touchIfExists(task.indexDir);
+        touchIfExists(manifestPath);
+        task.indexReused = true;
+        task.indexStatus = 'ready';
+        publish(task, 'index_ready', {
+          message: '复用已有 DuckDB 表格索引',
+          profile: summarizeToolResult({ sheets: task.workbookProfile.sheets || [] }),
+          task: publicTask(task),
+        });
+      } else {
+        task.indexStatus = 'indexing';
+        setTaskState(task, 'indexing', '正在构建大型表格索引');
+        publish(task, 'indexing', { message: '正在构建 DuckDB 表格索引', task: publicTask(task) });
+        const indexed = await buildWorkbookIndex(task);
+        task.indexDir = indexed.indexDir;
+        task.workbookProfile = indexed.manifest;
+        task.indexReused = false;
+        task.indexStatus = 'ready';
+        touchIfExists(task.fileCacheDir);
+        touchIfExists(task.indexDir);
+        publish(task, 'index_ready', {
+          message: '表格索引构建完成',
+          profile: summarizeToolResult({ sheets: indexed.manifest.sheets }),
+          task: publicTask(task),
+        });
+      }
     }
 
+    assertTaskNotCancelled(task);
     setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
     task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
 
+    assertTaskNotCancelled(task);
     setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
     await exploreDataWithTools(task);
 
+    assertTaskNotCancelled(task);
     const questions = task.questions && task.questions.length ? task.questions : needsClarification(task);
     if (questions.length && !task.clarifications.length) {
       setTaskState(task, 'needs_clarification', '需要人工确认后继续', { questions });
       return;
     }
 
+    assertTaskNotCancelled(task);
     setTaskState(task, 'generating_code', '正在生成 Python 处理脚本');
     writeGeneratedCode(task, await generateCode(task));
     log('info', 'code_generated', { taskId: task.id, codeLength: task.generatedCode.length });
@@ -1416,6 +1646,7 @@ async function executeWorkflow(task) {
     for (let attempt = 0; attempt <= REPAIR_LIMIT; attempt += 1) {
       setTaskState(task, attempt === 0 ? 'executing' : 'repairing', attempt === 0 ? '正在沙盒执行' : `正在自修复并重试第 ${attempt} 次`);
       const result = await runSandbox(task);
+      if (result.cancelled) throw cancelledError();
       if (result.ok) {
         task.outputPath = result.output;
         task.executionWarning = result.warning || '';
@@ -1451,6 +1682,12 @@ async function executeWorkflow(task) {
     }
     setTaskState(task, 'failed', lastError || '沙盒执行失败');
   } catch (error) {
+    if (isCancelledError(error) || task.cancelRequested) {
+      task.indexStatus = task.indexStatus === 'indexing' ? 'cancelled' : task.indexStatus;
+      if (task.state !== 'cancelled') setTaskState(task, 'cancelled', '任务已手动停止');
+      log('info', 'workflow_cancelled', { taskId: task.id });
+      return;
+    }
     if (task.state === 'indexing') task.indexStatus = 'failed';
     log('error', 'workflow_failed', { taskId: task.id, error: error.message });
     setTaskState(task, 'failed', error.message);
@@ -1477,16 +1714,31 @@ async function createTask(req, res) {
   if (!requirement) throw new Error('请输入处理需求');
 
   const id = crypto.randomUUID();
-  const dir = path.join(TASK_DIR, id);
+  const dir = path.join(TASKS_DIR, id);
   fs.mkdirSync(dir, { recursive: true });
-  const filename = file.filename.replace(/[^\w\u4e00-\u9fa5.\-() ]/g, '_');
-  const filePath = path.join(dir, filename);
-  fs.writeFileSync(filePath, file.content);
+  const originalName = file.filename.replace(/[^\w\u4e00-\u9fa5.\-() ]/g, '_');
+  const ext = path.extname(originalName).toLowerCase();
+  const filename = originalName || `source${ext || '.xlsx'}`;
+  const fileHash = crypto.createHash('sha256').update(file.content).digest('hex');
+  const fileCacheDir = path.join(FILES_DIR, fileHash);
+  fs.mkdirSync(fileCacheDir, { recursive: true });
+  const filePath = path.join(fileCacheDir, `source${ext || '.xlsx'}`);
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, file.content);
+  }
+  touchIfExists(filePath);
+  touchIfExists(fileCacheDir);
+  const indexDir = path.join(fileCacheDir, 'index');
+  const indexManifestPath = path.join(indexDir, 'manifest.json');
+  const indexReused = fs.existsSync(indexManifestPath);
   log('info', 'task_file_saved', {
     taskId: id,
     filename,
+    fileHash,
     sizeBytes: file.content.length,
     dir,
+    fileCacheDir,
+    indexReused,
   });
 
   const now = new Date().toISOString();
@@ -1494,6 +1746,8 @@ async function createTask(req, res) {
     id,
     dir,
     filePath,
+    fileHash,
+    fileCacheDir,
     filename,
     requirement,
     temporaryRules,
@@ -1502,12 +1756,16 @@ async function createTask(req, res) {
     retrievedRules: [],
     clarifications: [],
     indexStatus: 'pending',
-    indexDir: '',
+    indexDir,
+    indexReused,
     workbookProfile: null,
     agentPlan: null,
     validationReport: null,
     agentTrace: [],
     agentExplorationSummary: '',
+    cancelRequested: false,
+    children: new Set(),
+    abortController: null,
     events: [],
     state: 'uploaded',
     message: '文件已上传',
@@ -1521,8 +1779,10 @@ async function createTask(req, res) {
 
   setImmediate(async () => {
     try {
+      assertTaskNotCancelled(task);
       setTaskState(task, 'metadata_ready', '正在解析元数据');
       task.metadata = await extractMetadata(filePath, filename, previewRows);
+      assertTaskNotCancelled(task);
       log('info', 'metadata_extracted', {
         taskId: task.id,
         columns: task.metadata.columns.length,
@@ -1533,6 +1793,10 @@ async function createTask(req, res) {
       setTaskState(task, 'metadata_ready', '元数据解析完成');
       executeWorkflow(task);
     } catch (error) {
+      if (isCancelledError(error) || task.cancelRequested) {
+        if (task.state !== 'cancelled') setTaskState(task, 'cancelled', '任务已手动停止');
+        return;
+      }
       log('error', 'metadata_extract_failed', { taskId: task.id, error: error.message });
       setTaskState(task, 'failed', error.message);
     }
@@ -1627,7 +1891,13 @@ async function route(req, res) {
       });
       return;
     }
+    if (action === 'cancel' && req.method === 'POST') {
+      const accepted = cancelTask(task, '任务已手动停止');
+      sendJson(res, accepted ? 202 : 409, publicTask(task));
+      return;
+    }
     if (action === 'clarifications' && req.method === 'POST') {
+      assertTaskNotCancelled(task);
       const body = await parseJsonBody(req);
       task.clarifications.push({ answer: String(body.answer || '').trim(), at: new Date().toISOString() });
       publish(task, 'clarification', { answer: body.answer });
