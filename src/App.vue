@@ -297,57 +297,6 @@
         </div>
       </div>
     </div>
-
-    <!-- 悬浮 Agent 追踪球 -->
-    <div class="floating-agent-trigger" v-if="task && task.agentTrace && task.agentTrace.length > 0" :class="{ 'is-tracing': isAgentTracing }" @click="showTracePanel = true" title="查看 Agent 工具调用">
-      <svg v-if="isAgentTracing" class="spinner-svg trigger-icon" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>
-      <svg v-else class="trigger-icon" viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-      <span v-if="isAgentTracing" class="float-pulse"></span>
-    </div>
-
-    <!-- Agent 工具调用详情抽屉侧边栏 -->
-    <div v-if="showTracePanel" class="trace-drawer-backdrop" @click.self="showTracePanel = false">
-      <div class="trace-drawer">
-        <div class="trace-drawer-header">
-          <div>
-            <h3>Agent 思考与工具调用</h3>
-            <span class="trace-count-badge">共 {{ task?.agentTrace?.length || 0 }} 步</span>
-          </div>
-          <button type="button" class="icon-button close-drawer" @click="showTracePanel = false" title="关闭">
-            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-          </button>
-        </div>
-        <div class="trace-drawer-content">
-          <div class="agent-traces-list">
-            <details v-for="(trace, index) in task?.agentTrace" :key="index" class="trace-details-box" :open="!trace.result || index === task.agentTrace.length - 1">
-              <summary>
-                <div class="summary-left">
-                  <span class="status-icon" :class="{ 'is-running': !trace.result, 'is-done': trace.result }">
-                    <svg v-if="trace.result" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                    <svg v-else viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="spinner-svg"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>
-                  </span>
-                  <span class="tool-name">{{ trace.toolName }}</span>
-                </div>
-                <span class="trace-time">{{ formatTime(trace.at) }}</span>
-              </summary>
-              <div class="trace-body">
-                <div class="trace-section">
-                  <div class="trace-label">调用参数 (Arguments)</div>
-                  <pre class="trace-code">{{ JSON.stringify(trace.args, null, 2) }}</pre>
-                </div>
-                <div class="trace-section" v-if="trace.result">
-                  <div class="trace-label">返回结果 (Result)</div>
-                  <pre class="trace-code">{{ JSON.stringify(trace.result, null, 2) }}</pre>
-                </div>
-                <div class="trace-section" v-else>
-                  <div class="trace-label is-running-text">工具执行中，等待返回...</div>
-                </div>
-              </div>
-            </details>
-          </div>
-        </div>
-      </div>
-    </div>
   </main>
 
 
@@ -445,13 +394,6 @@ const currentQuestions = ref<string[]>([]);
 const clarificationDismissed = ref(false);
 const taskPollingTimer = ref<number | null>(null);
 const logPollingTimer = ref<number | null>(null);
-
-const showTracePanel = ref(false);
-const isAgentTracing = computed(() => {
-  const trace = task.value?.agentTrace;
-  if (!trace || trace.length === 0) return false;
-  return !trace[trace.length - 1].result;
-});
 
 const showTracePanel = ref(false);
 const isAgentTracing = computed(() => {
@@ -1754,133 +1696,6 @@ th {
   background: #e1e7e3;
   color: #2c3631;
 }
-
-/* 以下复用之前的 .agent-traces-list 等样式，确保嵌套正确即可 */
-
-/* 新增：悬浮球样式 */
-.floating-agent-trigger {
-  position: fixed;
-  bottom: 40px;
-  right: 40px;
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: #10a37f;
-  color: white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 4px 12px rgba(16, 163, 127, 0.3);
-  cursor: pointer;
-  z-index: 1000;
-  transition: transform 0.2s, box-shadow 0.2s;
-}
-
-.floating-agent-trigger:hover {
-  transform: scale(1.05) translateY(-2px);
-  box-shadow: 0 6px 16px rgba(16, 163, 127, 0.4);
-}
-
-.floating-agent-trigger.is-tracing {
-  background: #2c3631;
-  box-shadow: 0 4px 12px rgba(44, 54, 49, 0.3);
-}
-
-.trigger-icon {
-  width: 28px;
-  height: 28px;
-}
-
-.float-pulse {
-  position: absolute;
-  top: -2px;
-  right: -2px;
-  width: 12px;
-  height: 12px;
-  background: #10a37f;
-  border: 2px solid white;
-  border-radius: 50%;
-  animation: pulse 1.5s infinite;
-}
-
-/* 新增：抽屉侧边栏样式 */
-.trace-drawer-backdrop {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100vw;
-  height: 100vh;
-  background: rgba(0, 0, 0, 0.3);
-  z-index: 1001;
-  display: flex;
-  justify-content: flex-end;
-  backdrop-filter: blur(2px);
-}
-
-.trace-drawer {
-  width: 480px;
-  max-width: 90vw;
-  height: 100vh;
-  background: #fbfcfa;
-  box-shadow: -4px 0 24px rgba(0, 0, 0, 0.1);
-  display: flex;
-  flex-direction: column;
-  animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-@keyframes slideIn {
-  from { transform: translateX(100%); }
-  to { transform: translateX(0); }
-}
-
-.trace-drawer-header {
-  padding: 20px 24px;
-  background: #fff;
-  border-bottom: 1px solid #e1e7e3;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.trace-drawer-header h3 {
-  margin: 0;
-  font-size: 16px;
-  color: #2c3631;
-  display: inline-block;
-  margin-right: 12px;
-}
-
-.trace-count-badge {
-  font-size: 12px;
-  background: #e1e7e3;
-  padding: 2px 8px;
-  border-radius: 12px;
-  color: #526259;
-  vertical-align: middle;
-}
-
-.trace-drawer-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 20px 24px;
-}
-
-.close-drawer {
-  background: #f1f4f2;
-  border-radius: 50%;
-  width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.close-drawer:hover {
-  background: #e1e7e3;
-  color: #2c3631;
-}
-
-/* 以下复用之前的 .agent-traces-list 等样式，确保嵌套正确即可 */
 </style>
 
 
