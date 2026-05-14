@@ -1794,6 +1794,25 @@ function writeGeneratedCode(task, code) {
   return scriptPath;
 }
 
+function ensureSandboxInputFile(task) {
+  const sourcePath = path.resolve(task.filePath);
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error('源文件不存在');
+  }
+  const ext = path.extname(task.filename || sourcePath) || path.extname(sourcePath) || '.xlsx';
+  const sandboxInput = path.join(task.dir, `input${ext.toLowerCase()}`);
+  if (!isPathInside(task.dir, sandboxInput)) {
+    throw new Error('沙盒输入文件路径非法');
+  }
+  const sourceStat = fs.statSync(sourcePath);
+  const targetExists = fs.existsSync(sandboxInput);
+  const targetStat = targetExists ? fs.statSync(sandboxInput) : null;
+  if (!targetExists || targetStat.size !== sourceStat.size) {
+    fs.copyFileSync(sourcePath, sandboxInput);
+  }
+  return sandboxInput;
+}
+
 function runSandbox(task) {
   return new Promise((resolve) => {
     try {
@@ -1807,14 +1826,22 @@ function runSandbox(task) {
     const script = path.join(task.dir, 'generated.py');
     const output = path.join(task.dir, 'output.xlsx');
     const timeoutSeconds = Math.max(1, Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    let sandboxInput;
+    try {
+      sandboxInput = ensureSandboxInputFile(task);
+    } catch (error) {
+      resolve({ ok: false, error: error.message });
+      return;
+    }
     log('info', 'sandbox_started', {
       taskId: task.id,
       python,
       timeoutMs: SANDBOX_TIMEOUT_MS,
       script,
+      input: sandboxInput,
       output,
     });
-    const child = spawn(python, [runner, script, task.filePath, output, String(timeoutSeconds)], {
+    const child = spawn(python, [runner, script, sandboxInput, output, String(timeoutSeconds)], {
       cwd: task.dir,
       windowsHide: true,
       env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
