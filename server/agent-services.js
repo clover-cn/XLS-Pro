@@ -114,6 +114,28 @@ function createAgentServices({
     }
     return null;
   }
+
+  function materializeCachedToolResult(cacheHit, toolName, args) {
+    if (cacheHit.cacheKind === 'covered_range' && toolName === 'excel_read_rows' && cacheHit.rawResult?.data) {
+      const startRow = Number(args.startRow);
+      const endRow = Number(args.endRow);
+      const source = cacheHit.rawResult.data;
+      const rows = (source.rows || []).filter((row) => Number(row.rowNumber) >= startRow && Number(row.rowNumber) <= endRow);
+      const sliced = {
+        ...source,
+        startRow,
+        endRow,
+        rows,
+      };
+      const modelContent = compactToolContentForModel({ data: sliced }, toolName);
+      const resultSummary = summarizeToolResult({ data: sliced });
+      return { modelContent, resultSummary };
+    }
+    return {
+      modelContent: cacheHit.modelContent,
+      resultSummary: cacheHit.resultSummary,
+    };
+  }
   
   function toolPriority(toolName, args = {}) {
     if (toolName === 'excel_list_sheets') return 100;
@@ -204,6 +226,111 @@ function createAgentServices({
       questions.push('表头包含应收或往来字段，请确认是否包含员工借款、押金等需要单独分类的业务。');
     }
     return questions;
+  }
+
+  function rowValues(rawRows, rowNumber) {
+    return (rawRows || []).find((row) => Number(row.rowNumber) === Number(rowNumber))?.values || [];
+  }
+
+  function looksNumeric(value) {
+    return /^-?\d+(?:,\d{3})*(?:\.\d+)?$/.test(String(value || '').trim());
+  }
+
+  function inferSimpleAggregationPlan(task) {
+    const metadata = task.metadata || {};
+    const requirement = String(task.requirement || '');
+    if (!/用量|数量|次数|金额|合计|总计|总和|求和|一共|所有|多少|sum|total/i.test(requirement)) return null;
+    const asksWholeTable = /所有|全部|整体|总计|合计|总和|求和|一共|总共|total|sum/i.test(requirement);
+    const hasScopedCondition = /\d{4}[-年/]|[一二三四五六七八九十\d]{1,2}月|到|至|之间|按|每|分类|筛选|大于|小于|等于|包含|where|group/i.test(requirement);
+    if (!asksWholeTable && hasScopedCondition) return null;
+    const operation = /平均|均值|avg|average/i.test(requirement)
+      ? 'avg'
+      : /最大|max/i.test(requirement)
+        ? 'max'
+        : /最小|min/i.test(requirement)
+          ? 'min'
+          : 'sum';
+    const rawRows = Array.isArray(metadata.rawRows) ? metadata.rawRows : [];
+    const headerRowNumber = Number(metadata.detectedHeaderRowNumber || 0);
+    const headerValues = rowValues(rawRows, headerRowNumber).map((value) => String(value || '').trim());
+    const dataRow = rawRows.find((row) => Number(row.rowNumber) > headerRowNumber && (row.values || []).some((value) => String(value || '').trim()));
+    if (!headerRowNumber || !headerValues.some(Boolean) || !dataRow) return null;
+
+    const metricKeywords = ['用量', '数量', '次数', '金额', '收入', '支出', '余额'];
+    const timeKeywords = ['时间', '日期', 'date', 'time'];
+    let bestMetric = null;
+    for (const [index, name] of headerValues.entries()) {
+      if (!name) continue;
+      const sampleValue = dataRow.values?.[index] || '';
+      const isTime = timeKeywords.some((keyword) => name.toLowerCase().includes(keyword.toLowerCase()));
+      let score = 0;
+      if (requirement.includes(name)) score += 12;
+      if (metricKeywords.some((keyword) => name.includes(keyword))) score += 8;
+      if (looksNumeric(sampleValue)) score += 4;
+      if (isTime) score -= 10;
+      if (!bestMetric || score > bestMetric.score) {
+        bestMetric = { index, name, score, sampleValue };
+      }
+    }
+    if (!bestMetric || bestMetric.score < 8) return null;
+    const firstDataRowNumber = Number(dataRow.rowNumber);
+    const sheetName = metadata.sheetName || (metadata.sheetNames || [])[0] || '';
+    const operationText = { sum: '求和', avg: '求平均值', max: '取最大值', min: '取最小值' }[operation] || '聚合';
+    return {
+      status: 'ready',
+      confidence: 0.9,
+      evidence: [
+        {
+          tool: 'metadata_preview',
+          finding: `预览行已覆盖真实表头第 ${headerRowNumber} 行，识别到列：${headerValues.filter(Boolean).join('、')}；第 ${firstDataRowNumber} 行已出现数据样例。`,
+          rows: [headerRowNumber, firstDataRowNumber],
+        },
+      ],
+      needed_columns: [bestMetric.name],
+      implementation_plan: [
+        `直接读取工作表 ${sheetName || '默认工作表'}。`,
+        `使用第 ${headerRowNumber} 行作为表头，pandas 读取时设置 skiprows=${headerRowNumber - 1}。`,
+        `对 ${bestMetric.name} 列执行 ${operationText}，由本地 Python 脚本处理全表数据，不在模型探索阶段扫描整表。`,
+      ].join(' '),
+      questions: [],
+      fastPath: 'metadata_preview_simple_aggregation',
+      aggregation: {
+        sheetName,
+        column: bestMetric.name,
+        operation,
+        headerRowNumber,
+        firstDataRowNumber,
+      },
+    };
+  }
+
+  function isCoreAggregateResult(task, toolName, args, toolContent) {
+    if (toolName !== 'excel_aggregate') return false;
+    const rows = Array.isArray(toolContent?.rows) ? toolContent.rows : [];
+    if (!rows.length || rows[0]?.value === null || rows[0]?.value === undefined) return false;
+    const requirement = String(task.requirement || '');
+    const operation = args.operation || 'sum';
+    if (operation === 'sum' && /用量|数量|次数|金额|合计|总计|总和|求和|一共|所有|多少/i.test(requirement)) return true;
+    if (operation === 'avg' && /平均|均值/i.test(requirement)) return true;
+    if (operation === 'max' && /最大|最高/i.test(requirement)) return true;
+    if (operation === 'min' && /最小|最低/i.test(requirement)) return true;
+    return false;
+  }
+
+  function compactAgentToolTraceForCode(trace = []) {
+    const kept = [];
+    const seen = new Set();
+    for (const item of trace) {
+      const result = item.result || {};
+      const cacheHit = Boolean(result.cacheHit);
+      const lowValueRead = item.toolName === 'excel_read_rows' && cacheHit;
+      if (lowValueRead) continue;
+      const key = `${item.toolName}:${stableStringify(item.args || {})}:${JSON.stringify(result).slice(0, 200)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(item);
+    }
+    return kept.slice(-8);
   }
   
   function isSuspiciousGeneratedCode(code) {
@@ -867,6 +994,10 @@ function createAgentServices({
     }
     const model = process.env.OPENAI_MODEL || 'gpt-4o';
     task.agentTrace = [];
+    const fastPlan = inferSimpleAggregationPlan(task);
+    if (fastPlan) {
+      return applyAgentPlan(task, fastPlan);
+    }
     const toolCache = new Map();
     const systemPrompt = [
       '你是一个 Excel 数据探索 Agent。',
@@ -975,6 +1106,7 @@ function createAgentServices({
           .map((item) => item.index),
       );
   
+      let forceFinalReason = '';
       for (const item of parsedToolCalls) {
         assertTaskNotCancelled(task);
         const { toolCall, toolName, args, reason, argumentError, cacheHit } = item;
@@ -997,8 +1129,9 @@ function createAgentServices({
         try {
           if (argumentError) throw argumentError;
           if (cacheHit) {
-            toolContent = { ...cacheHit.modelContent, cacheHit: true, cacheKind: cacheHit.cacheKind };
-            traceItem.result = { ...cacheHit.resultSummary, cacheHit: cacheHit.cacheKind };
+            const cached = materializeCachedToolResult(cacheHit, toolName, args);
+            toolContent = { ...cached.modelContent, cacheHit: true, cacheKind: cacheHit.cacheKind };
+            traceItem.result = { ...cached.resultSummary, cacheHit: cacheHit.cacheKind };
             publish(task, 'tool_result', {
               message: `${toolName} 复用缓存摘要`,
               toolName,
@@ -1022,6 +1155,9 @@ function createAgentServices({
             const resultSummary = summarizeToolResult(result);
             const modelContent = compactToolContentForModel(result, toolName);
             traceItem.result = resultSummary;
+            if (isCoreAggregateResult(task, toolName, args, modelContent)) {
+              forceFinalReason = `${toolName} 已得到足以回答用户需求的核心聚合结果。`;
+            }
             publish(task, 'tool_result', {
               message: `${toolName} 已返回摘要`,
               toolName,
@@ -1034,6 +1170,7 @@ function createAgentServices({
               normalizedArgs: normalizeToolArgs(toolName, args),
               resultSummary,
               modelContent,
+              rawResult: result,
             });
           }
         } catch (error) {
@@ -1055,6 +1192,9 @@ function createAgentServices({
           name: toolName,
           content: JSON.stringify(toolContent),
         });
+      }
+      if (forceFinalReason) {
+        return requestFinalExplorationJson(task, messages, model, round + 1, forceFinalReason);
       }
       if (toolCallCount >= AGENT_TOOL_CALL_LIMIT - AGENT_FORCE_FINAL_REMAINING) {
         return requestFinalExplorationJson(task, messages, model, round + 1, '工具预算即将耗尽。');
@@ -1110,7 +1250,7 @@ function createAgentServices({
       `clarifications = ${JSON.stringify(task.clarifications || [])}`,
       `agent_plan = ${JSON.stringify(task.agentPlan || {})}`,
       `agent_exploration_summary = ${task.agentExplorationSummary || '无'}`,
-      `agent_tool_trace = ${JSON.stringify(task.agentTrace || [])}`,
+      `agent_tool_trace = ${JSON.stringify(compactAgentToolTraceForCode(task.agentTrace || []))}`,
     ].join('\n');
     try {
       const modelText = await callOpenAiCompatible([
@@ -1143,7 +1283,7 @@ function createAgentServices({
     ].join('\n');
     const modelText = await callOpenAiCompatible([
       { role: 'system', content: repairSystemPrompt },
-      { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nworkbook_profile = ${JSON.stringify(task.workbookProfile || {})}\nuser_requirement = ${task.requirement}\nagent_plan = ${JSON.stringify(task.agentPlan || {})}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(task.agentTrace || [])}` },
+      { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nworkbook_profile = ${JSON.stringify(task.workbookProfile || {})}\nuser_requirement = ${task.requirement}\nagent_plan = ${JSON.stringify(task.agentPlan || {})}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(compactAgentToolTraceForCode(task.agentTrace || []))}` },
     ], 0, { taskId: task.id, phase: 'repair_code' });
     const code = extractCodeBlock(modelText);
     if (!code || isSuspiciousGeneratedCode(code)) {

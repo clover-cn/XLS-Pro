@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { SANDBOX_TIMEOUT_MS, REPAIR_LIMIT } = require('./config');
+const { SANDBOX_TIMEOUT_MS, REPAIR_LIMIT, WORKBOOK_INDEX_VERSION } = require('./config');
 const { summarizeToolResult } = require('./tool-summary');
 
 function createWorkflow({
@@ -177,8 +177,21 @@ function createWorkflow({
       log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
       if (task.indexStatus !== 'ready') {
         const manifestPath = path.join(task.indexDir || path.join(task.dir, 'index'), 'manifest.json');
+        let reusableManifest = null;
         if (fs.existsSync(manifestPath)) {
-          task.workbookProfile = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          if (manifest.version === WORKBOOK_INDEX_VERSION) {
+            reusableManifest = manifest;
+          } else {
+            log('info', 'workbook_index_version_mismatch', {
+              taskId: task.id,
+              currentVersion: manifest.version || 0,
+              expectedVersion: WORKBOOK_INDEX_VERSION,
+            });
+          }
+        }
+        if (reusableManifest) {
+          task.workbookProfile = reusableManifest;
           touchIfExists(task.fileCacheDir);
           touchIfExists(task.indexDir);
           touchIfExists(manifestPath);
