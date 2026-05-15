@@ -3,10 +3,10 @@
     <section class="workspace">
       <aside class="sidebar">
         <div class="brand">
-          <span class="brand-mark">AW</span>
+          <span class="brand-mark">AI</span>
           <div>
-            <h1>AI 表格自动化</h1>
-            <p>本地沙盒执行，模型可按需读取和搜索表格。</p>
+            <h1>XLS-Pro</h1>
+            <p>AI驱动的表格自动化工具。</p>
           </div>
         </div>
 
@@ -269,7 +269,10 @@
                     <svg v-if="trace.result" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
                     <svg v-else viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="spinner-svg"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>
                   </span>
-                  <span class="tool-name">{{ trace.toolName }}</span>
+                  <span class="summary-copy">
+                    <span class="tool-name">{{ trace.toolName }}</span>
+                    <span class="tool-reason">{{ formatTraceReason(trace) }}</span>
+                  </span>
                 </div>
                 <span class="trace-time">{{ formatTime(trace.at) }}</span>
               </summary>
@@ -325,6 +328,14 @@ type KnowledgeRule = {
   score?: number;
 };
 
+type AgentTrace = {
+  toolName: string;
+  reason?: string;
+  args: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  at: string;
+};
+
 type Task = {
   id: string;
   filename: string;
@@ -345,7 +356,7 @@ type Task = {
   workbookProfile?: Record<string, unknown> | null;
   agentPlan?: Record<string, unknown> | null;
   validationReport?: Record<string, unknown> | null;
-  agentTrace?: { toolName: string; args: Record<string, unknown>; result?: Record<string, unknown>; at: string }[];
+  agentTrace?: AgentTrace[];
   agentExplorationSummary?: string;
   createdAt: string;
   updatedAt: string;
@@ -362,6 +373,7 @@ type AgentEvent = {
   code?: string;
   error?: string;
   toolName?: string;
+  reason?: string;
   args?: Record<string, unknown>;
   result?: Record<string, unknown>;
   profile?: Record<string, unknown>;
@@ -398,6 +410,11 @@ const isAgentTracing = computed(() => {
   if (!trace || trace.length === 0) return false;
   return !trace[trace.length - 1].result;
 });
+
+function formatTraceReason(trace: AgentTrace) {
+  const reason = (trace.reason || '').trim();
+  return reason || `我需要调用 ${trace.toolName} 来继续探索表格数据。`;
+}
 
 const logContainer = ref<HTMLElement | null>(null);
 

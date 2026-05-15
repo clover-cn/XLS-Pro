@@ -426,13 +426,42 @@ function createAgentServices({
     return match ? match[1].trim() : '';
   }
   
+  function withToolReasonParameters(parameters) {
+    const required = Array.isArray(parameters.required) ? parameters.required : [];
+    return {
+      ...parameters,
+      properties: {
+        reason: {
+          type: 'string',
+          description: '必填。用第一人称简短说明为什么本次需要调用这个工具，例如“我需要调用这个工具来确认相关工作表和表头结构”。',
+        },
+        ...(parameters.properties || {}),
+      },
+      required: Array.from(new Set(['reason', ...required])),
+      additionalProperties: false,
+    };
+  }
+
+  function traceToolReason(toolName, args = {}) {
+    const reason = String(args.reason || '').replace(/\s+/g, ' ').trim();
+    if (reason) {
+      return reason.length > 160 ? `${reason.slice(0, 160)}...` : reason;
+    }
+    return `我需要调用 ${toolName} 来继续探索表格数据。`;
+  }
+
+  function stripToolTraceOnlyArgs(args = {}) {
+    const { reason, ...toolArgs } = args;
+    return toolArgs;
+  }
+
   const EXCEL_AGENT_TOOLS = [
     {
       type: 'function',
       function: {
         name: 'excel_list_sheets',
         description: '列出当前工作簿的工作表、行数、列数和表头候选。先调用这个工具了解全局结构。',
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        parameters: withToolReasonParameters({ type: 'object', properties: {}, additionalProperties: false }),
       },
     },
     {
@@ -440,7 +469,7 @@ function createAgentServices({
       function: {
         name: 'excel_get_schema',
         description: '读取指定工作表的列结构、表头候选和前 20 行样本。用于确认列名、列号和表头行。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: {
@@ -449,7 +478,7 @@ function createAgentServices({
             },
           },
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -457,7 +486,7 @@ function createAgentServices({
       function: {
         name: 'excel_read_rows',
         description: '读取当前任务表格中指定工作表的连续行。行号为 Excel 语义的 1-based 闭区间，单次最多 200 行。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: {
@@ -477,7 +506,7 @@ function createAgentServices({
           },
           required: ['startRow', 'endRow'],
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -485,7 +514,7 @@ function createAgentServices({
       function: {
         name: 'excel_sample_rows',
         description: '读取指定工作表的样本行，支持 first、last、around、random。用于快速观察大表局部结构。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: { type: 'string', description: '可选。工作表名称。' },
@@ -494,7 +523,7 @@ function createAgentServices({
             count: { type: 'integer', minimum: 1, maximum: 200, description: '最多读取多少行，默认 20。' },
           },
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -502,7 +531,7 @@ function createAgentServices({
       function: {
         name: 'excel_search',
         description: '在索引中做大小写不敏感的文本包含搜索，返回 sheet、1-based 行号、列号、列名和值。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             query: { type: 'string', description: '要搜索的文本关键词，不能为空。' },
@@ -511,7 +540,7 @@ function createAgentServices({
           },
           required: ['query'],
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -519,7 +548,7 @@ function createAgentServices({
       function: {
         name: 'excel_filter_rows',
         description: '按列过滤行，适合定位大表中的候选记录。column 可用列名、列号或 c1/c2。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: { type: 'string', description: '可选。工作表名称。' },
@@ -530,7 +559,7 @@ function createAgentServices({
           },
           required: ['column'],
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -538,7 +567,7 @@ function createAgentServices({
       function: {
         name: 'excel_aggregate',
         description: '对指定列做 sum/avg/min/max/count，可选按另一列分组。适合先验证金额、数量、分类汇总。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: { type: 'string', description: '可选。工作表名称。' },
@@ -548,7 +577,7 @@ function createAgentServices({
           },
           required: ['column'],
           additionalProperties: false,
-        },
+        }),
       },
     },
     {
@@ -556,7 +585,7 @@ function createAgentServices({
       function: {
         name: 'excel_profile_column',
         description: '查看指定列的非空数量、去重数量、数值范围和高频值，帮助判断列语义。',
-        parameters: {
+        parameters: withToolReasonParameters({
           type: 'object',
           properties: {
             sheetName: { type: 'string', description: '可选。工作表名称。' },
@@ -564,7 +593,7 @@ function createAgentServices({
           },
           required: ['column'],
           additionalProperties: false,
-        },
+        }),
       },
     },
   ];
@@ -848,6 +877,7 @@ function createAgentServices({
       '用 search/filter/aggregate/profile 定位证据；只有需要确认表头或样本时才读取少量行。',
       '不要请求读取整个文件；需要大范围分析时使用 filter、aggregate 或 profile。',
       '不要重复请求相同工具参数；不要用 random 采样代替明确证据。',
+      '每次调用工具时，必须填写 reason 参数，用第一人称简短说明“我需要调用某某工具来做什么”。',
       '当剩余预算不足或信息足够时，立即停止调用工具，并只输出规定 JSON 对象。',
       '当信息足够时，停止调用工具，并只输出一个 JSON 对象，不要输出 Markdown。',
       'JSON 格式：{"status":"ready|needs_clarification","confidence":0-1,"evidence":[{"tool":"工具名","finding":"发现","rows":[行号]}],"needed_columns":["列名"],"implementation_plan":"后续代码生成依据","questions":["需要用户补充的问题"]}',
@@ -920,16 +950,18 @@ function createAgentServices({
       messages.push(toAssistantHistoryMessage(message, model));
   
       const parsedToolCalls = toolCalls.map((toolCall, index) => {
-        let args = {};
+        let rawArgs = {};
         let argumentError = null;
         try {
-          args = parseToolArguments(toolCall.function?.arguments || '{}');
+          rawArgs = parseToolArguments(toolCall.function?.arguments || '{}');
         } catch (error) {
           argumentError = error;
         }
         const toolName = toolCall.function?.name || '';
+        const args = argumentError ? {} : stripToolTraceOnlyArgs(rawArgs);
+        const reason = argumentError ? traceToolReason(toolName, {}) : traceToolReason(toolName, rawArgs);
         const cacheHit = argumentError ? null : findCachedToolResult(toolCache, toolName, args);
-        return { toolCall, index, toolName, args, argumentError, cacheHit };
+        return { toolCall, index, toolName, args, reason, argumentError, cacheHit };
       });
       const remainingBeforeRound = AGENT_TOOL_CALL_LIMIT - toolCallCount;
       const selectedIndexes = new Set(
@@ -945,16 +977,18 @@ function createAgentServices({
   
       for (const item of parsedToolCalls) {
         assertTaskNotCancelled(task);
-        const { toolCall, toolName, args, argumentError, cacheHit } = item;
+        const { toolCall, toolName, args, reason, argumentError, cacheHit } = item;
         const traceItem = {
           toolName,
+          reason,
           args: argumentError ? { invalidArguments: true } : summarizeToolArgs(args),
           at: new Date().toISOString(),
         };
         task.agentTrace.push(traceItem);
         publish(task, 'tool_call', {
-          message: `调用 ${toolName}`,
+          message: `调用 ${toolName}：${reason}`,
           toolName,
+          reason,
           args: traceItem.args,
           task: publicTask(task),
         });
