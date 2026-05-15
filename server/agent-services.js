@@ -304,6 +304,58 @@ function createAgentServices({
     };
   }
 
+  function parseDateRange(text) {
+    const normalized = String(text || '').replace(/\//g, '-').replace(/年|月/g, '-').replace(/日/g, '');
+    const matches = [...normalized.matchAll(/\d{4}-\d{1,2}-\d{1,2}/g)].map((match) => match[0]);
+    if (matches.length < 2) return null;
+    return { startDate: matches[0], endDate: matches[1] };
+  }
+
+  function inferWorkbookPatchPlan(task) {
+    const metadata = task.metadata || {};
+    if (metadata.fileKind !== 'xlsx') return null;
+    const requirement = String(task.requirement || '');
+    if (!/改成|修改为|设为|置为|清零|变成|替换为|填为/.test(requirement)) return null;
+    const dateRange = parseDateRange(requirement);
+    if (!dateRange) return null;
+    const rawRows = Array.isArray(metadata.rawRows) ? metadata.rawRows : [];
+    const headerRowNumber = Number(metadata.detectedHeaderRowNumber || 0);
+    const headerValues = rowValues(rawRows, headerRowNumber).map((value) => String(value || '').trim());
+    if (!headerRowNumber || !headerValues.some(Boolean)) return null;
+    const conditionColumn = headerValues.find((name) => /日期|时间|date|time/i.test(name));
+    const targetColumn = headerValues.find((name) => name && requirement.includes(name) && name !== conditionColumn)
+      || headerValues.find((name) => /用量|数量|次数|金额|收入|支出|余额/i.test(name));
+    if (!conditionColumn || !targetColumn) return null;
+    const valueMatch = /(?:改成|修改为|设为|置为|变成|替换为|填为)\s*([-+]?\d+(?:\.\d+)?|[^，。；\s]+)/.exec(requirement);
+    const newValue = /清零/.test(requirement) ? '0' : (valueMatch ? valueMatch[1] : null);
+    if (newValue === null || newValue === undefined || newValue === '') return null;
+    const sheetName = metadata.sheetName || (metadata.sheetNames || [])[0] || '';
+    return {
+      status: 'ready',
+      confidence: 0.9,
+      evidence: [
+        {
+          tool: 'metadata_preview',
+          finding: `识别为格式保留型修改任务：按 ${conditionColumn} 在 ${dateRange.startDate} 到 ${dateRange.endDate} 的范围内修改 ${targetColumn}。`,
+          rows: [headerRowNumber],
+        },
+      ],
+      needed_columns: [conditionColumn, targetColumn],
+      implementation_plan: `复制原工作簿并直接修改单元格：使用第 ${headerRowNumber} 行作为表头，将 ${conditionColumn} 在 ${dateRange.startDate} 到 ${dateRange.endDate} 范围内的 ${targetColumn} 改为 ${newValue}。`,
+      questions: [],
+      executionMode: 'workbook_patch',
+      workbookPatch: {
+        sheetName,
+        headerRowNumber,
+        conditionColumn,
+        targetColumn,
+        startDate: dateRange.startDate,
+        endDate: dateRange.endDate,
+        newValue,
+      },
+    };
+  }
+
   function isCoreAggregateResult(task, toolName, args, toolContent) {
     if (toolName !== 'excel_aggregate') return false;
     const rows = Array.isArray(toolContent?.rows) ? toolContent.rows : [];
@@ -954,6 +1006,21 @@ function createAgentServices({
     }
     return task.agentExplorationSummary;
   }
+
+  function tryPlanFromMetadata(task) {
+    task.agentTrace = [];
+    const patchPlan = inferWorkbookPatchPlan(task);
+    if (patchPlan) {
+      applyAgentPlan(task, patchPlan);
+      return true;
+    }
+    const fastPlan = inferSimpleAggregationPlan(task);
+    if (fastPlan) {
+      applyAgentPlan(task, fastPlan);
+      return true;
+    }
+    return false;
+  }
   
   async function requestFinalExplorationJson(task, messages, model, round, reason) {
     messages.push({
@@ -993,11 +1060,7 @@ function createAgentServices({
       throw new Error('缺少 OPENAI_API_KEY，无法执行模型工具调用探索');
     }
     const model = process.env.OPENAI_MODEL || 'gpt-4o';
-    task.agentTrace = [];
-    const fastPlan = inferSimpleAggregationPlan(task);
-    if (fastPlan) {
-      return applyAgentPlan(task, fastPlan);
-    }
+    if (tryPlanFromMetadata(task)) return task.agentExplorationSummary;
     const toolCache = new Map();
     const systemPrompt = [
       '你是一个 Excel 数据探索 Agent。',
@@ -1300,6 +1363,7 @@ function createAgentServices({
     extractCodeBlock,
     buildWorkbookIndex,
     runExcelTool,
+    tryPlanFromMetadata,
     exploreDataWithTools,
     generateCode,
     repairCode,

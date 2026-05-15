@@ -41,6 +41,7 @@ const workflow = createWorkflow({
   retrieveRules,
   summarizeToolResult,
   buildWorkbookIndex: agentServices.buildWorkbookIndex,
+  tryPlanFromMetadata: agentServices.tryPlanFromMetadata,
   exploreDataWithTools: agentServices.exploreDataWithTools,
   needsClarification: agentServices.needsClarification,
   generateCode: agentServices.generateCode,

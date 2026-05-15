@@ -18,6 +18,7 @@ function createWorkflow({
   extractMetadata,
   retrieveRules,
   buildWorkbookIndex,
+  tryPlanFromMetadata,
   exploreDataWithTools,
   needsClarification,
   generateCode,
@@ -145,6 +146,79 @@ function createWorkflow({
       });
     });
   }
+
+  function runWorkbookPatch(task) {
+    return new Promise((resolve) => {
+      try {
+        assertTaskNotCancelled(task);
+      } catch (error) {
+        resolve({ ok: false, cancelled: true, error: error.message });
+        return;
+      }
+      const patch = task.agentPlan?.workbookPatch;
+      if (!patch) {
+        resolve({ ok: false, error: '缺少 workbookPatch 执行计划' });
+        return;
+      }
+      const python = process.env.PYTHON_BIN || 'python';
+      const script = path.join(__dirname, 'workbook_patch.py');
+      const output = path.join(task.dir, 'output.xlsx');
+      let sandboxInput;
+      try {
+        sandboxInput = ensureSandboxInputFile(task);
+      } catch (error) {
+        resolve({ ok: false, error: error.message });
+        return;
+      }
+      log('info', 'workbook_patch_started', {
+        taskId: task.id,
+        python,
+        input: sandboxInput,
+        output,
+        patch,
+      });
+      const child = spawn(python, [script, sandboxInput, output, JSON.stringify(patch)], {
+        cwd: task.dir,
+        windowsHide: true,
+        env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+      });
+      trackChildProcess(task, child, 'workbook-patch');
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => child.kill('SIGKILL'), SANDBOX_TIMEOUT_MS + 1000);
+      child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        log('error', 'workbook_patch_spawn_failed', { taskId: task.id, error: error.message });
+        resolve({ ok: false, error: error.message });
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (task.cancelRequested) {
+          resolve({ ok: false, cancelled: true, error: '任务已手动停止' });
+          return;
+        }
+        let parsed;
+        try {
+          parsed = JSON.parse(stdout.trim().split(/\r?\n/).pop() || '{}');
+        } catch (error) {
+          resolve({ ok: false, error: `格式保留修改输出无法解析: ${(stderr || stdout || error.message).slice(0, 500)}` });
+          return;
+        }
+        if (code !== 0 || !parsed.ok) {
+          resolve({ ok: false, error: parsed.error || stderr || `格式保留修改失败，退出码 ${code}`, detail: parsed.detail || '' });
+          return;
+        }
+        log('info', 'workbook_patch_finished', {
+          taskId: task.id,
+          changedCellCount: parsed.data?.changedCellCount || 0,
+          outputExists: fs.existsSync(output),
+        });
+        resolve({ ok: true, output, patchResult: parsed.data });
+      });
+    });
+  }
   
   async function validateOutput(task, outputPath) {
     const report = {
@@ -175,7 +249,12 @@ function createWorkflow({
     try {
       assertTaskNotCancelled(task);
       log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
-      if (task.indexStatus !== 'ready') {
+
+      assertTaskNotCancelled(task);
+      setTaskState(task, 'exploring_data', '正在基于预览判断是否可直接处理');
+      const hasMetadataPlan = tryPlanFromMetadata(task);
+
+      if (!hasMetadataPlan && task.indexStatus !== 'ready') {
         const manifestPath = path.join(task.indexDir || path.join(task.dir, 'index'), 'manifest.json');
         let reusableManifest = null;
         if (fs.existsSync(manifestPath)) {
@@ -222,12 +301,14 @@ function createWorkflow({
       }
   
       assertTaskNotCancelled(task);
-      setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
-      task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
+      if (!hasMetadataPlan) {
+        setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
+        task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
   
-      assertTaskNotCancelled(task);
-      setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
-      await exploreDataWithTools(task);
+        assertTaskNotCancelled(task);
+        setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
+        await exploreDataWithTools(task);
+      }
   
       assertTaskNotCancelled(task);
       const questions = task.questions && task.questions.length
@@ -235,6 +316,37 @@ function createWorkflow({
         : (task.agentPlan?.status === 'ready' ? [] : needsClarification(task));
       if (questions.length && !task.clarifications.length) {
         setTaskState(task, 'needs_clarification', '需要人工确认后继续', { questions });
+        return;
+      }
+
+      if (task.agentPlan?.executionMode === 'workbook_patch') {
+        assertTaskNotCancelled(task);
+        setTaskState(task, 'executing', '正在按原格式修改工作簿');
+        task.generatedCode = '# 使用格式保留型 workbook_patch 工具执行，本任务未生成 pandas 脚本。';
+        const result = await runWorkbookPatch(task);
+        if (result.cancelled) throw cancelledError();
+        if (!result.ok) {
+          const message = `${result.error || ''}\n${result.detail || ''}`.trim();
+          publish(task, 'error', { message });
+          setTaskState(task, 'failed', message || '格式保留修改失败');
+          return;
+        }
+        task.outputPath = result.output;
+        task.executionWarning = '';
+        task.validationReport = await validateOutput(task, result.output);
+        task.validationReport.patchResult = result.patchResult;
+        publish(task, 'validation', {
+          message: `格式保留修改完成：已修改 ${result.patchResult?.changedCellCount || 0} 个单元格`,
+          report: task.validationReport,
+          task: publicTask(task),
+        });
+        log('info', 'workflow_completed', {
+          taskId: task.id,
+          mode: 'workbook_patch',
+          outputPath: task.outputPath,
+          changedCellCount: result.patchResult?.changedCellCount || 0,
+        });
+        setTaskState(task, 'completed', '处理完成，可下载结果');
         return;
       }
   
@@ -300,6 +412,7 @@ function createWorkflow({
     executeWorkflow,
     validateOutput,
     runSandbox,
+    runWorkbookPatch,
     writeGeneratedCode,
   };
 }
