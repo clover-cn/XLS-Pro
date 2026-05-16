@@ -1060,7 +1060,7 @@ function createAgentServices({
     return '';
   }
 
-  function extendToolBudgetIfJustified(task, budgetState, messages, round, trigger) {
+  function extendToolBudgetIfJustified(task, budgetState, messages, round, trigger, options = {}) {
     const reason = budgetExtensionReason(task, budgetState.extensionCount);
     if (!reason) return false;
     budgetState.extensionCount += 1;
@@ -1088,13 +1088,18 @@ function createAgentServices({
       activeLimit: budgetState.activeLimit,
       task: publicTask(task),
     });
-    messages.push({
-      role: 'user',
-      content: [
-        message,
-        '额外预算只能用于补足关键证据、确认字段/分类或验证结果；禁止重复调用已缓存参数，信息足够时立即输出规定 JSON。',
-      ].join('\n'),
-    });
+    const modelNotice = [
+      message,
+      '额外预算只能用于补足关键证据、确认字段/分类或验证结果；禁止重复调用已缓存参数，信息足够时立即输出规定 JSON。',
+    ].join('\n');
+    if (options.appendMessage === false) {
+      budgetState.pendingNotice = modelNotice;
+    } else {
+      messages.push({
+        role: 'user',
+        content: modelNotice,
+      });
+    }
     return true;
   }
 
@@ -1181,6 +1186,7 @@ function createAgentServices({
     const budgetState = {
       activeLimit: AGENT_TOOL_CALL_LIMIT,
       extensionCount: 0,
+      pendingNotice: '',
     };
     const maxRounds = AGENT_TOOL_CALL_LIMIT
       + (AGENT_TOOL_BUDGET_EXTENSION_CALLS * AGENT_TOOL_BUDGET_EXTENSION_LIMIT)
@@ -1244,10 +1250,24 @@ function createAgentServices({
         const cacheHit = argumentError ? null : findCachedToolResult(toolCache, toolName, args);
         return { toolCall, index, toolName, args, reason, argumentError, cacheHit };
       });
-      const remainingBeforeRound = budgetState.activeLimit - toolCallCount;
+      const executableToolCalls = parsedToolCalls.filter((item) => !item.argumentError && !item.cacheHit);
+      const requestedThisRound = Math.min(executableToolCalls.length, AGENT_TOOL_CALLS_PER_ROUND);
+      let remainingBeforeRound = budgetState.activeLimit - toolCallCount;
+      if (requestedThisRound > remainingBeforeRound) {
+        const extended = extendToolBudgetIfJustified(
+          task,
+          budgetState,
+          messages,
+          round,
+          '本轮请求的工具数量超过剩余预算',
+          { appendMessage: false },
+        );
+        if (extended) {
+          remainingBeforeRound = budgetState.activeLimit - toolCallCount;
+        }
+      }
       const selectedIndexes = new Set(
-        parsedToolCalls
-          .filter((item) => !item.argumentError && !item.cacheHit)
+        executableToolCalls
           .sort((left, right) => {
             const priorityDelta = toolPriority(right.toolName, right.args) - toolPriority(left.toolName, left.args);
             return priorityDelta || left.index - right.index;
@@ -1342,6 +1362,13 @@ function createAgentServices({
           name: toolName,
           content: JSON.stringify(toolContent),
         });
+      }
+      if (budgetState.pendingNotice) {
+        messages.push({
+          role: 'user',
+          content: budgetState.pendingNotice,
+        });
+        budgetState.pendingNotice = '';
       }
       if (forceFinalReason) {
         return requestFinalExplorationJson(task, messages, model, round + 1, forceFinalReason, budgetState.activeLimit);
