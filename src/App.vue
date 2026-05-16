@@ -629,7 +629,7 @@ function connectEvents(id: string) {
     fetchTaskLogs();
   });
 
-  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'agent_summary', 'validation'].forEach((eventName) => {
+  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'tool_budget_extended', 'agent_summary', 'validation'].forEach((eventName) => {
     source.addEventListener(eventName, (message) => {
       const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
       events.value.unshift(event);

@@ -19,9 +19,13 @@ TASK_STORAGE_DIR=.agentic-tasks
 SANDBOX_TIMEOUT_MS=60000
 EXCEL_TOOL_TIMEOUT_MS=30000
 WORKBOOK_INDEX_TIMEOUT_MS=600000
+AGENT_TOOL_BUDGET_EXTENSION_CALLS=8
+AGENT_TOOL_BUDGET_EXTENSION_LIMIT=2
 ```
 
 `OPENAI_API_KEY` 必须配置，并且当前 `OPENAI_MODEL` / `OPENAI_BASE_URL` 必须支持 Chat Completions 原生 `tools` / `tool_calls`。系统会先让模型用只读工具探索当前表格，再生成定制 Python；如果模型不支持工具调用、工具探索失败，或返回示例/硬编码脚本，任务会失败并写入日志，不再静默改跑无关脚本。
+
+工具探索默认有固定预算，复杂任务接近上限时会按理由扩展预算。默认最多扩展 2 轮，每轮增加 8 次工具调用；扩展原因会写入日志和 SSE 事件，避免模型无节制循环调用工具。
 
 当前机器上的 `python` 命令可能指向 WindowsApps 启动器；处理 `.xlsx`、构建索引和执行沙盒前，请配置真实的 `PYTHON_BIN`，并确保安装：
 

@@ -9,6 +9,8 @@ const {
   AGENT_TOOL_CALL_LIMIT,
   AGENT_TOOL_CALLS_PER_ROUND,
   AGENT_FORCE_FINAL_REMAINING,
+  AGENT_TOOL_BUDGET_EXTENSION_CALLS,
+  AGENT_TOOL_BUDGET_EXTENSION_LIMIT,
 } = require('./config');
 const {
   summarizeToolArgs,
@@ -1022,12 +1024,86 @@ function createAgentServices({
     return false;
   }
   
-  async function requestFinalExplorationJson(task, messages, model, round, reason) {
+  function totalRowsFromTask(task) {
+    const metadataRows = Number(task.metadata?.totalRows || 0);
+    const indexedRows = (task.workbookProfile?.sheets || []).reduce(
+      (sum, sheet) => sum + Number(sheet.totalRows || 0),
+      0,
+    );
+    return Math.max(metadataRows, indexedRows);
+  }
+
+  function budgetExtensionReason(task, extensionCount) {
+    if (extensionCount >= AGENT_TOOL_BUDGET_EXTENSION_LIMIT) return '';
+    if (AGENT_TOOL_BUDGET_EXTENSION_CALLS <= 0) return '';
+    const requirement = String(task.requirement || '');
+    const sheets = task.workbookProfile?.sheets || [];
+    const totalRows = totalRowsFromTask(task);
+    const totalColumns = Math.max(
+      Number(task.metadata?.totalColumns || 0),
+      ...sheets.map((sheet) => Number(sheet.totalColumns || 0)),
+    );
+    const trace = task.agentTrace || [];
+    const hasToolError = trace.some((item) => item.result?.ok === false || item.result?.error);
+    if (/现金流量表|现金流|序时账|经营活动|投资活动|筹资活动|勾稽/.test(requirement)) {
+      return '需求涉及现金流量表或序时账，需要额外预算补足分类依据、异常样本或勾稽验证。';
+    }
+    if (sheets.length > 1) {
+      return `工作簿包含 ${sheets.length} 个工作表，需要额外预算确认相关表和字段。`;
+    }
+    if (totalRows >= 10000 || totalColumns >= 30) {
+      return `表格规模较大（约 ${totalRows || '未知'} 行、${totalColumns || '未知'} 列），需要额外预算完成结构确认和关键聚合。`;
+    }
+    if (hasToolError) {
+      return '已有可恢复工具调用失败消耗预算，需要额外预算调整参数补足证据。';
+    }
+    return '';
+  }
+
+  function extendToolBudgetIfJustified(task, budgetState, messages, round, trigger) {
+    const reason = budgetExtensionReason(task, budgetState.extensionCount);
+    if (!reason) return false;
+    budgetState.extensionCount += 1;
+    budgetState.activeLimit += AGENT_TOOL_BUDGET_EXTENSION_CALLS;
+    const message = [
+      `工具预算扩展 ${budgetState.extensionCount}/${AGENT_TOOL_BUDGET_EXTENSION_LIMIT}：${reason}`,
+      `触发原因：${trigger}`,
+      `新的工具预算上限为 ${budgetState.activeLimit} 次。`,
+    ].join('\n');
+    log('info', 'agent_tool_budget_extended', {
+      taskId: task.id,
+      round,
+      reason,
+      trigger,
+      extensionCount: budgetState.extensionCount,
+      addedCalls: AGENT_TOOL_BUDGET_EXTENSION_CALLS,
+      activeLimit: budgetState.activeLimit,
+    });
+    publish(task, 'tool_budget_extended', {
+      message,
+      reason,
+      trigger,
+      extensionCount: budgetState.extensionCount,
+      addedCalls: AGENT_TOOL_BUDGET_EXTENSION_CALLS,
+      activeLimit: budgetState.activeLimit,
+      task: publicTask(task),
+    });
+    messages.push({
+      role: 'user',
+      content: [
+        message,
+        '额外预算只能用于补足关键证据、确认字段/分类或验证结果；禁止重复调用已缓存参数，信息足够时立即输出规定 JSON。',
+      ].join('\n'),
+    });
+    return true;
+  }
+
+  async function requestFinalExplorationJson(task, messages, model, round, reason, budgetLimit = AGENT_TOOL_CALL_LIMIT) {
     messages.push({
       role: 'user',
       content: [
         reason,
-        `当前 Excel 工具预算上限为 ${AGENT_TOOL_CALL_LIMIT} 次，已进入收敛阶段。`,
+        `当前 Excel 工具预算上限为 ${budgetLimit} 次，已进入收敛阶段。`,
         '现在禁止继续调用工具。请只基于已有工具结果输出规定 JSON 对象，不要输出 Markdown，不要生成代码。',
       ].join('\n'),
     });
@@ -1066,7 +1142,8 @@ function createAgentServices({
       '你是一个 Excel 数据探索 Agent。',
       '你必须通过提供的索引工具按需查询当前上传表格，不能假设没有查询过的数据。',
       '工具行号均为 Excel 语义的 1-based 行号；列可以用列名、列号或 c1/c2。',
-      `工具总预算最多 ${AGENT_TOOL_CALL_LIMIT} 次；每轮最多请求 ${AGENT_TOOL_CALLS_PER_ROUND} 个工具。`,
+      `基础工具预算最多 ${AGENT_TOOL_CALL_LIMIT} 次；每轮最多请求 ${AGENT_TOOL_CALLS_PER_ROUND} 个工具。`,
+      `复杂任务接近预算上限时，系统最多可扩展 ${AGENT_TOOL_BUDGET_EXTENSION_LIMIT} 轮，每轮增加 ${AGENT_TOOL_BUDGET_EXTENSION_CALLS} 次，但必须由系统记录明确理由。`,
       '先调用 excel_list_sheets 判断相关工作表，只对最相关工作表调用 excel_get_schema，不要一次性扫描所有 sheet schema。',
       '用 search/filter/aggregate/profile 定位证据；只有需要确认表头或样本时才读取少量行。',
       '不要请求读取整个文件；需要大范围分析时使用 filter、aggregate 或 profile。',
@@ -1101,10 +1178,20 @@ function createAgentServices({
     ];
   
     let toolCallCount = 0;
-    for (let round = 0; round <= AGENT_TOOL_CALL_LIMIT; round += 1) {
+    const budgetState = {
+      activeLimit: AGENT_TOOL_CALL_LIMIT,
+      extensionCount: 0,
+    };
+    const maxRounds = AGENT_TOOL_CALL_LIMIT
+      + (AGENT_TOOL_BUDGET_EXTENSION_CALLS * AGENT_TOOL_BUDGET_EXTENSION_LIMIT)
+      + 1;
+    for (let round = 0; round <= maxRounds; round += 1) {
       assertTaskNotCancelled(task);
-      if (toolCallCount >= AGENT_TOOL_CALL_LIMIT - AGENT_FORCE_FINAL_REMAINING) {
-        return requestFinalExplorationJson(task, messages, model, round, '工具预算即将耗尽。');
+      if (toolCallCount >= budgetState.activeLimit - AGENT_FORCE_FINAL_REMAINING) {
+        const extended = extendToolBudgetIfJustified(task, budgetState, messages, round, '工具预算即将耗尽');
+        if (!extended) {
+          return requestFinalExplorationJson(task, messages, model, round, '工具预算即将耗尽。', budgetState.activeLimit);
+        }
       }
       const message = await callOpenAiCompatible(messages, 0, {
         taskId: task.id,
@@ -1157,7 +1244,7 @@ function createAgentServices({
         const cacheHit = argumentError ? null : findCachedToolResult(toolCache, toolName, args);
         return { toolCall, index, toolName, args, reason, argumentError, cacheHit };
       });
-      const remainingBeforeRound = AGENT_TOOL_CALL_LIMIT - toolCallCount;
+      const remainingBeforeRound = budgetState.activeLimit - toolCallCount;
       const selectedIndexes = new Set(
         parsedToolCalls
           .filter((item) => !item.argumentError && !item.cacheHit)
@@ -1202,7 +1289,7 @@ function createAgentServices({
               task: publicTask(task),
             });
           } else if (!selectedIndexes.has(item.index)) {
-            const remainingBudget = AGENT_TOOL_CALL_LIMIT - toolCallCount;
+            const remainingBudget = budgetState.activeLimit - toolCallCount;
             const reason = remainingBudget <= 0 ? '工具总预算已用完' : '本轮工具执行名额已用完';
             toolContent = budgetSkippedToolContent(toolName, reason, remainingBudget);
             traceItem.result = summarizeToolResult(toolContent);
@@ -1257,13 +1344,16 @@ function createAgentServices({
         });
       }
       if (forceFinalReason) {
-        return requestFinalExplorationJson(task, messages, model, round + 1, forceFinalReason);
+        return requestFinalExplorationJson(task, messages, model, round + 1, forceFinalReason, budgetState.activeLimit);
       }
-      if (toolCallCount >= AGENT_TOOL_CALL_LIMIT - AGENT_FORCE_FINAL_REMAINING) {
-        return requestFinalExplorationJson(task, messages, model, round + 1, '工具预算即将耗尽。');
+      if (toolCallCount >= budgetState.activeLimit - AGENT_FORCE_FINAL_REMAINING) {
+        const extended = extendToolBudgetIfJustified(task, budgetState, messages, round + 1, '本轮工具执行后预算即将耗尽');
+        if (!extended) {
+          return requestFinalExplorationJson(task, messages, model, round + 1, '工具预算即将耗尽。', budgetState.activeLimit);
+        }
       }
     }
-    return requestFinalExplorationJson(task, messages, model, AGENT_TOOL_CALL_LIMIT + 1, '已达到探索轮次上限。');
+    return requestFinalExplorationJson(task, messages, model, maxRounds + 1, '已达到探索轮次上限。', budgetState.activeLimit);
   }
   
   async function generateCode(task) {
