@@ -10,6 +10,7 @@ const TASK_DIR = resolveProjectPath(process.env.TASK_STORAGE_DIR || '.agentic-ta
 const FILES_DIR = path.join(TASK_DIR, 'files');
 const TASKS_DIR = path.join(TASK_DIR, 'tasks');
 const LOG_FILE = path.join(TASK_DIR, 'server-runtime.log');
+const SEMANTIC_CACHE_DB = resolveProjectPath(process.env.SEMANTIC_CACHE_DB || path.join('data', 'semantic-cache.sqlite'));
 const DIST_DIR = path.join(ROOT, 'dist');
 const PORT = Number(process.env.PORT || 3100);
 const SANDBOX_TIMEOUT_MS = Number(process.env.SANDBOX_TIMEOUT_MS || 60000);
@@ -23,6 +24,8 @@ const AGENT_TOOL_BUDGET_EXTENSION_LIMIT = Number(process.env.AGENT_TOOL_BUDGET_E
 const EXCEL_TOOL_TIMEOUT_MS = Number(process.env.EXCEL_TOOL_TIMEOUT_MS || 30000);
 const WORKBOOK_INDEX_TIMEOUT_MS = Number(process.env.WORKBOOK_INDEX_TIMEOUT_MS || 10 * 60 * 1000);
 const TASK_CACHE_TTL_MS = Number(process.env.TASK_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
+const SEMANTIC_BATCH_SIZE = Number(process.env.SEMANTIC_BATCH_SIZE || 120);
+const SEMANTIC_MAX_UNIQUE = Number(process.env.SEMANTIC_MAX_UNIQUE || 2000);
 const TERMINAL_STATES = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
 const ACTIVE_STATES = new Set([
   'uploaded',
@@ -68,6 +71,7 @@ module.exports = {
   FILES_DIR,
   TASKS_DIR,
   LOG_FILE,
+  SEMANTIC_CACHE_DB,
   DIST_DIR,
   PORT,
   SANDBOX_TIMEOUT_MS,
@@ -81,6 +85,8 @@ module.exports = {
   EXCEL_TOOL_TIMEOUT_MS,
   WORKBOOK_INDEX_TIMEOUT_MS,
   TASK_CACHE_TTL_MS,
+  SEMANTIC_BATCH_SIZE,
+  SEMANTIC_MAX_UNIQUE,
   TERMINAL_STATES,
   ACTIVE_STATES,
   loadEnvFile,

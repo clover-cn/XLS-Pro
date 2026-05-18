@@ -8,6 +8,7 @@ const { retrieveRules } = require('./rules');
 const { summarizeToolResult } = require('./tool-summary');
 const { createTaskState } = require('./task-state');
 const { createAgentServices } = require('./agent-services');
+const { createSemanticCache } = require('./semantic-cache');
 const { createWorkflow } = require('./workflow');
 const { createRouter } = require('./routes');
 const { sendJson } = require('./http-utils');
@@ -15,6 +16,7 @@ const { sendJson } = require('./http-utils');
 const tasks = new Map();
 const clients = new Map();
 const cache = createCacheMaintenance({ log });
+const semanticCache = createSemanticCache({ log });
 const taskState = createTaskState({ log, clients });
 const agentServices = createAgentServices({
   tasks,
@@ -43,9 +45,12 @@ const workflow = createWorkflow({
   buildWorkbookIndex: agentServices.buildWorkbookIndex,
   tryPlanFromMetadata: agentServices.tryPlanFromMetadata,
   exploreDataWithTools: agentServices.exploreDataWithTools,
+  routeTaskIntent: agentServices.routeTaskIntent,
+  classifySemanticItems: agentServices.classifySemanticItems,
   needsClarification: agentServices.needsClarification,
   generateCode: agentServices.generateCode,
   repairCode: agentServices.repairCode,
+  semanticCache,
 });
 const route = createRouter({
   tasks,

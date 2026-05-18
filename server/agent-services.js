@@ -11,6 +11,7 @@ const {
   AGENT_FORCE_FINAL_REMAINING,
   AGENT_TOOL_BUDGET_EXTENSION_CALLS,
   AGENT_TOOL_BUDGET_EXTENSION_LIMIT,
+  SEMANTIC_BATCH_SIZE,
 } = require('./config');
 const {
   summarizeToolArgs,
@@ -428,6 +429,15 @@ function createAgentServices({
     if (!/OUTPUT_FILE/.test(code)) {
       failures.push('必须写入 OUTPUT_FILE');
     }
+    if (/\bdef\s+classify\w*\s*\(/i.test(code)) {
+      failures.push('禁止在 Python 中编写业务分类函数，请使用语义映射表贴标');
+    }
+    if (/\.str\.contains\s*\(/.test(code) && /(分类|类别|标签|现金流|情感|归类|判定|活动)/.test(code)) {
+      failures.push('禁止用 str.contains/正则对非结构化文本做业务归类');
+    }
+    if (/\bre\.(?:search|match|findall|sub)\s*\(/.test(code) && /(分类|类别|标签|现金流|情感|归类|判定|活动)/.test(code)) {
+      failures.push('禁止用正则对非结构化文本做业务归类');
+    }
     if (failures.length) {
       throw new Error(`生成代码未满足执行合同：${failures.join('；')}`);
     }
@@ -843,6 +853,21 @@ function createAgentServices({
       return JSON.parse(source.slice(start, end + 1));
     } catch (error) {
       return null;
+    }
+  }
+
+  function extractJsonArray(text) {
+    if (!text) return [];
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    const source = fenced ? fenced[1] : text;
+    const start = source.indexOf('[');
+    const end = source.lastIndexOf(']');
+    if (start === -1 || end === -1 || end <= start) return [];
+    try {
+      const parsed = JSON.parse(source.slice(start, end + 1));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      return [];
     }
   }
   
@@ -1413,6 +1438,211 @@ function createAgentServices({
     }
     return requestFinalExplorationJson(task, messages, model, maxRounds + 1, '已达到探索轮次上限。', budgetState.activeLimit);
   }
+
+  function defaultSemanticSubjects(task) {
+    const columns = task.metadata?.columns || [];
+    const names = columns.map((column) => column.name).filter(Boolean);
+    const preferred = ['摘要', '备注', '评论', '内容', '描述', '科目', '名称', '客户', '供应商', '用途'];
+    const matched = names.filter((name) => preferred.some((token) => String(name).includes(token)));
+    return matched.slice(0, 4);
+  }
+
+  function defaultTaxonomy(requirement) {
+    if (/现金流量表|现金流/.test(requirement)) {
+      return [
+        '销售商品、提供劳务收到的现金',
+        '收到的税费返还',
+        '收到其他与经营活动有关的现金',
+        '购买商品、接受劳务支付的现金',
+        '支付给职工以及为职工支付的现金',
+        '支付的各项税费',
+        '支付其他与经营活动有关的现金',
+        '收回投资收到的现金',
+        '取得投资收益收到的现金',
+        '处置固定资产、无形资产和其他长期资产收回的现金净额',
+        '购建固定资产、无形资产和其他长期资产支付的现金',
+        '投资支付的现金',
+        '取得借款收到的现金',
+        '偿还债务支付的现金',
+        '分配股利、利润或偿付利息支付的现金',
+        '支付其他与筹资活动有关的现金',
+        '未分类',
+      ];
+    }
+    if (/情感|评价|评论|满意|差评|好评/.test(requirement)) {
+      return ['正向', '中性', '负向', '未分类'];
+    }
+    if (/风险|异常|可疑/.test(requirement)) {
+      return ['正常', '异常', '高风险', '需复核'];
+    }
+    return ['类别A', '类别B', '类别C', '未分类'];
+  }
+
+  function heuristicRoute(task) {
+    const requirement = String(task.requirement || '');
+    const semanticRequired = /分类|归类|标签|打标|识别|判断|情感|评论|摘要|现金流量表|现金流|风险|异常|主观|语义/i.test(requirement);
+    const hybrid = /现金流量表|现金流|凭证|序时账|勾稽|对方科目/i.test(requirement);
+    return {
+      status: 'ready',
+      route: {
+        task_type: semanticRequired ? (hybrid ? 'hybrid' : 'semantic_mapping') : 'deterministic',
+        semantic_required: semanticRequired,
+        domain_hint: hybrid ? 'cash_flow' : 'general',
+        confidence: semanticRequired ? 0.72 : 0.68,
+        reason: semanticRequired
+          ? '需求包含分类、标签、摘要理解或业务语义判断，不能只依赖代码规则。'
+          : '需求看起来主要是结构化计算、筛选或聚合。',
+      },
+      semanticPlan: semanticRequired ? {
+        subject_columns: defaultSemanticSubjects(task),
+        taxonomy: defaultTaxonomy(requirement),
+        taxonomy_version: hybrid ? 'cash-flow-v1' : 'default-v1',
+        prompt_version: 'semantic-mapping-v1',
+      } : null,
+    };
+  }
+
+  function normalizeRoutePlan(task, rawPlan) {
+    const fallback = heuristicRoute(task);
+    const route = rawPlan?.route || rawPlan || fallback.route;
+    const taskType = String(route.task_type || route.taskType || '').trim() || fallback.route.task_type;
+    const semanticRequired = route.semantic_required !== undefined
+      ? Boolean(route.semantic_required)
+      : ['semantic', 'semantic_mapping', 'hybrid'].includes(taskType);
+    const semanticPlan = rawPlan?.semanticPlan || rawPlan?.semantic_plan || fallback.semanticPlan || {};
+    const subjectColumns = semanticPlan.subject_columns || semanticPlan.semantic_subjects || semanticPlan.columns || fallback.semanticPlan?.subject_columns || [];
+    const taxonomy = semanticPlan.taxonomy || semanticPlan.labels || fallback.semanticPlan?.taxonomy || defaultTaxonomy(task.requirement);
+    return {
+      status: 'ready',
+      route: {
+        task_type: semanticRequired && taskType === 'semantic' ? 'semantic_mapping' : taskType,
+        semantic_required: semanticRequired,
+        domain_hint: route.domain_hint || route.domain || fallback.route.domain_hint || 'general',
+        output_shape: route.output_shape || route.outputShape || '',
+        confidence: Number(route.confidence || fallback.route.confidence || 0.5),
+        reason: route.reason || fallback.route.reason || '',
+      },
+      semanticPlan: semanticRequired ? {
+        subject_columns: (Array.isArray(subjectColumns) ? subjectColumns : [subjectColumns]).filter(Boolean).slice(0, 4),
+        taxonomy: (Array.isArray(taxonomy) ? taxonomy : String(taxonomy).split(/[，,、]/)).filter(Boolean).slice(0, 80),
+        taxonomy_version: semanticPlan.taxonomy_version || semanticPlan.taxonomyVersion || fallback.semanticPlan?.taxonomy_version || 'default-v1',
+        prompt_version: semanticPlan.prompt_version || semanticPlan.promptVersion || 'semantic-mapping-v1',
+      } : null,
+    };
+  }
+
+  async function routeTaskIntent(task) {
+    if (task.agentPlan?.route?.task_type) return task.agentPlan;
+    const heuristic = heuristicRoute(task);
+    if (!process.env.OPENAI_API_KEY) {
+      task.agentPlan = { ...(task.agentPlan || {}), ...heuristic };
+      return task.agentPlan;
+    }
+    const prompt = [
+      '你是一个表格任务意图路由器，只输出 JSON，不要输出 Markdown。',
+      '判断用户需求是否需要非结构化文本语义理解。不要生成代码。',
+      '',
+      'task_type 只能是 deterministic、semantic_mapping、hybrid：',
+      '- deterministic：结构化筛选、计算、聚合、合并、透视即可完成。',
+      '- semantic_mapping：需要理解摘要、备注、评论、描述、名称等文本含义并打标签。',
+      '- hybrid：先结构化抽取候选，再语义映射，最后确定性汇总。',
+      '',
+      '输出 JSON 结构：',
+      '{"route":{"task_type":"","semantic_required":true,"domain_hint":"","output_shape":"","confidence":0.0,"reason":""},"semanticPlan":{"subject_columns":["列名"],"taxonomy":["标签"],"taxonomy_version":"default-v1","prompt_version":"semantic-mapping-v1"}}',
+      '',
+      '【用户需求】',
+      task.requirement,
+      '',
+      '【探索结论】',
+      task.agentExplorationSummary || '',
+      '',
+      '【元数据列】',
+      JSON.stringify((task.metadata?.columns || []).map((column) => column.name)),
+      '',
+      '【已有 Agent Plan】',
+      JSON.stringify(task.agentPlan || {}),
+    ].join('\n');
+    const text = await callOpenAiCompatible([
+      { role: 'system', content: '你只做任务路由，整个回复必须是 JSON 对象。' },
+      { role: 'user', content: prompt },
+    ], 0, { taskId: task.id, phase: 'triage' }, { stream: false });
+    const parsed = extractJsonObject(text || '') || heuristic;
+    const plan = normalizeRoutePlan(task, parsed);
+    task.agentPlan = { ...(task.agentPlan || {}), ...plan };
+    publish(task, 'agent_summary', {
+      message: `意图路由：${plan.route.task_type}`,
+      plan: task.agentPlan,
+      task: publicTask(task),
+    });
+    return task.agentPlan;
+  }
+
+  async function classifySemanticItems(task, items, semanticPlan) {
+    if (!items.length) return [];
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('缺少 OPENAI_API_KEY，无法对新增语义项进行分类');
+    }
+    const model = process.env.OPENAI_MODEL || 'gpt-4o';
+    const taxonomy = semanticPlan.taxonomy || [];
+    const output = [];
+    for (let offset = 0; offset < items.length; offset += SEMANTIC_BATCH_SIZE) {
+      const batch = items.slice(offset, offset + SEMANTIC_BATCH_SIZE);
+      const batchNumber = Math.floor(offset / SEMANTIC_BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(items.length / SEMANTIC_BATCH_SIZE);
+      publish(task, 'classify_progress', {
+        message: `正在分类第 ${batchNumber}/${totalBatches} 批（共 ${batch.length} 条）...`,
+        batch: batchNumber,
+        totalBatches,
+        batchSize: batch.length,
+        classified: output.length,
+        total: items.length,
+      });
+      const prompt = [
+        '你是语义映射器，只输出 JSON 数组，不要输出 Markdown。',
+        '请根据用户需求和标签体系，把每个 key 映射到一个业务标签。',
+        '必须只使用 taxonomy 中的标签；不确定时使用“未分类”或最接近的待复核标签，并降低 confidence。',
+        '',
+        '【用户需求】',
+        task.requirement,
+        '',
+        '【标签体系 taxonomy】',
+        JSON.stringify(taxonomy),
+        '',
+        '【语义列】',
+        JSON.stringify(semanticPlan.subject_columns || []),
+        '',
+        '【待分类 items】',
+        JSON.stringify(batch.map((item) => ({ key: item.key, sample: item.sample, count: item.count }))),
+        '',
+        '输出格式：[{"key":"原 key","label":"标签","confidence":0.0,"reason":"简短理由"}]',
+      ].join('\n');
+      const text = await callOpenAiCompatible([
+        { role: 'system', content: '你只做语义映射，输出合法 JSON 数组。' },
+        { role: 'user', content: prompt },
+      ], 0, { taskId: task.id, phase: 'semantic_classify', batch: batchNumber }, { stream: false });
+      const rows = extractJsonArray(text || '');
+      const byKey = new Map(rows.map((row) => [String(row.key || ''), row]));
+      for (const item of batch) {
+        const row = byKey.get(item.key) || {};
+        const label = !taxonomy.length || taxonomy.includes(row.label) ? (row.label || '未分类') : '未分类';
+        output.push({
+          key: item.key,
+          label,
+          confidence: Number(row.confidence || 0),
+          reason: row.reason || '',
+          source: 'llm',
+        });
+      }
+      publish(task, 'classify_progress', {
+        message: `第 ${batchNumber}/${totalBatches} 批分类完成，累计已分类 ${output.length}/${items.length}`,
+        batch: batchNumber,
+        totalBatches,
+        classified: output.length,
+        total: items.length,
+      });
+    }
+    return output;
+  }
   
   async function generateCode(task) {
     const systemPrompt = [
@@ -1424,7 +1654,8 @@ function createAgentServices({
       '禁止导入或使用 os、sys、pathlib、subprocess、requests、socket、urllib、http、shutil、ctypes。',
       '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
       '禁止创建示例数据、示例文件、dummy 数据，必须处理真实 INPUT_FILE。',
-    ].join('\n');
+      '禁止在 Python 中用 if/elif/else、正则、str.contains 或关键词包含规则对非结构化文本做业务归类。',
+      ].join('\n');
     const prompt = [
       '请严格按以下执行合同生成 Python 源码，并包裹在唯一的 Markdown Python 代码块中。',
       '',
@@ -1435,6 +1666,8 @@ function createAgentServices({
       '- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。',
       '- 禁止调用 globals/locals/open/eval/exec/compile/__import__。',
       '- 禁止创建示例输入文件、示例 DataFrame、dummy/Alice/Bob/Charlie 数据。',
+      '- 禁止在 Python 代码中使用 if/elif/else、正则表达式、str.contains 或关键词表对“摘要/备注/评论/描述/科目名称”等非结构化文本做业务归类。',
+      '- 如果任务需要语义分类，必须依赖 agent_plan.semanticPlan 中给出的映射结果；代码只能负责读取、匹配、贴标、计算和输出。',
       '- 必须 import pandas as pd。',
       '- 必须把结果写入 OUTPUT_FILE，且至少一个 sheet。',
       '',
@@ -1513,6 +1746,8 @@ function createAgentServices({
     runExcelTool,
     tryPlanFromMetadata,
     exploreDataWithTools,
+    routeTaskIntent,
+    classifySemanticItems,
     generateCode,
     repairCode,
   };
