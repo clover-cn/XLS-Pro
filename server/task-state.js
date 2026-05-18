@@ -53,6 +53,18 @@ function createTaskState({ log, clients }) {
   }
   
   function setTaskState(task, state, message, extra = {}) {
+    const previousState = task.state;
+    if (state === 'failed') {
+      task.failedStage = extra.failedStage || task.resumeStage || previousState || 'uploaded';
+      task.lastError = message || task.lastError || '';
+      task.retrying = false;
+    } else if (!['completed', 'cancelled'].includes(state)) {
+      task.resumeStage = state;
+      if (state !== 'needs_clarification') task.failedStage = '';
+    } else {
+      task.retrying = false;
+      task.failedStage = '';
+    }
     task.state = state;
     task.updatedAt = new Date().toISOString();
     if (message) task.message = message;
@@ -84,6 +96,11 @@ function createTaskState({ log, clients }) {
       agentTrace: task.agentTrace || [],
       agentExplorationSummary: task.agentExplorationSummary || '',
       questions: task.questions || [],
+      failedStage: task.failedStage || '',
+      lastError: task.lastError || '',
+      retryCount: task.retryCount || 0,
+      retrying: Boolean(task.retrying),
+      resumeStage: task.resumeStage || '',
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
     };

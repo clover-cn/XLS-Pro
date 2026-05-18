@@ -30,9 +30,11 @@ const ACTIVE_STATES = new Set([
   'indexing',
   'retrieving_rules',
   'exploring_data',
+  'classifying',
   'generating_code',
   'executing',
   'repairing',
+  'validating_output',
 ]);
 
 function loadEnvFile(filePath) {

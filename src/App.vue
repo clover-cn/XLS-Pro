@@ -69,6 +69,9 @@
             <button v-if="canCancelTask" type="button" class="danger-button" :disabled="isCancelling" @click="cancelTask">
               {{ isCancelling ? '停止中' : '停止任务' }}
             </button>
+            <button v-if="canRetryTask" type="button" class="primary-button compact-action" :disabled="isRetrying" @click="retryTask">
+              {{ isRetrying ? '继续中' : '继续当前任务' }}
+            </button>
             <a v-if="task?.outputReady" class="download-link" :href="downloadUrl">下载结果</a>
             <a v-if="task" class="download-link" :href="`/api/tasks/${task.id}/logs`" target="_blank" rel="noreferrer">查看日志</a>
           </div>
@@ -103,7 +106,7 @@
               </div>
             </article>
 
-            <article class="panel execution-panel" :class="{ 'is-active-agent': task && ['exploring_data', 'generating_code', 'executing', 'repairing'].includes(task.state) }">
+            <article class="panel execution-panel" :class="{ 'is-active-agent': task && ['exploring_data', 'classifying', 'generating_code', 'executing', 'repairing', 'validating_output'].includes(task.state) }">
               <div class="panel-header">
                 <div>
                   <h3>Python 执行窗口</h3>
@@ -361,6 +364,11 @@ type Task = {
   createdAt: string;
   updatedAt: string;
   questions?: string[];
+  failedStage?: string;
+  lastError?: string;
+  retryCount?: number;
+  retrying?: boolean;
+  resumeStage?: string;
 };
 
 type AgentEvent = {
@@ -398,6 +406,7 @@ const events = ref<AgentEvent[]>([]);
 const logText = ref('');
 const isSubmitting = ref(false);
 const isCancelling = ref(false);
+const isRetrying = ref(false);
 const eventSource = ref<EventSource | null>(null);
 const currentQuestions = ref<string[]>([]);
 const clarificationDismissed = ref(false);
@@ -467,10 +476,12 @@ const statusText: Record<string, string> = {
   indexing: '正在构建索引',
   retrieving_rules: '正在召回规则',
   exploring_data: '正在探索表格',
+  classifying: '正在语义分类',
   needs_clarification: '等待人工确认',
   generating_code: '正在生成代码',
   executing: '正在沙盒执行',
   repairing: '正在自修复',
+  validating_output: '正在校验结果',
   completed: '处理完成',
   failed: '处理失败',
   cancelled: '已停止',
@@ -484,17 +495,20 @@ const statusLabel = computed(() => {
 const downloadUrl = computed(() => (task.value ? `/api/tasks/${task.value.id}/output` : '#'));
 
 const terminalStates = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
-const cancellableStates = new Set(['uploaded', 'metadata_ready', 'indexing', 'retrieving_rules', 'exploring_data', 'generating_code', 'executing', 'repairing', 'needs_clarification']);
+const cancellableStates = new Set(['uploaded', 'metadata_ready', 'indexing', 'retrieving_rules', 'exploring_data', 'classifying', 'generating_code', 'executing', 'repairing', 'validating_output', 'needs_clarification']);
 
 const canCancelTask = computed(() => Boolean(task.value && cancellableStates.has(task.value.state)));
+const canRetryTask = computed(() => Boolean(task.value && task.value.state === 'failed' && !task.value.retrying));
 
 const executionMessage = computed(() => {
   if (!task.value) return '等待创建任务';
   if (task.value.state === 'indexing') return '正在为大型表格构建本地查询索引。';
   if (task.value.state === 'exploring_data') return '模型正在调用工具搜索表格并读取指定行。';
+  if (task.value.state === 'classifying') return '正在对唯一值组合做语义分类。';
   if (task.value.state === 'generating_code') return '模型正在生成可执行 Python 代码。';
   if (task.value.state === 'executing') return '沙盒正在运行生成的 Python 脚本。';
   if (task.value.state === 'repairing') return '脚本执行失败，模型正在自修复并重试。';
+  if (task.value.state === 'validating_output') return '正在校验输出文件是否可用。';
   if (task.value.state === 'completed' && task.value.executionWarning) return '结果文件已生成，执行过程中存在警告。';
   if (task.value.state === 'completed') return '沙盒执行完成，结果文件已就绪。';
   if (task.value.state === 'failed') return '任务失败，请查看日志和错误信息。';
@@ -629,7 +643,7 @@ function connectEvents(id: string) {
     fetchTaskLogs();
   });
 
-  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'tool_budget_extended', 'agent_summary', 'validation'].forEach((eventName) => {
+  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'tool_budget_extended', 'agent_summary', 'classify_progress', 'validation', 'resume'].forEach((eventName) => {
     source.addEventListener(eventName, (message) => {
       const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
       events.value.unshift(event);
@@ -678,6 +692,28 @@ async function createTask() {
     alert(error instanceof Error ? error.message : '任务创建失败');
   } finally {
     isSubmitting.value = false;
+  }
+}
+
+async function retryTask() {
+  if (!task.value || isRetrying.value) return;
+  isRetrying.value = true;
+  try {
+    const response = await fetch(`/api/tasks/${task.value.id}/retry`, { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || '继续任务失败');
+    }
+    task.value = payload;
+    if (task.value) {
+      connectEvents(task.value.id);
+      startPolling(task.value.id);
+    }
+    fetchTaskLogs();
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '继续任务失败');
+  } finally {
+    isRetrying.value = false;
   }
 }
 

@@ -81,6 +81,11 @@ function createRouter({
       metadata: null,
       retrievedRules: [],
       clarifications: [],
+      failedStage: '',
+      lastError: '',
+      retryCount: 0,
+      retrying: false,
+      resumeStage: 'uploaded',
       indexStatus: 'pending',
       indexDir,
       indexReused,
@@ -220,6 +225,26 @@ function createRouter({
       if (action === 'cancel' && req.method === 'POST') {
         const accepted = cancelTask(task, '任务已手动停止');
         sendJson(res, accepted ? 202 : 409, publicTask(task));
+        return;
+      }
+      if (action === 'retry' && req.method === 'POST') {
+        if (task.state !== 'failed') {
+          sendJson(res, 409, { error: '只有失败任务可以继续执行', task: publicTask(task) });
+          return;
+        }
+        task.cancelRequested = false;
+        task.abortController = null;
+        task.retrying = true;
+        task.retryCount = (task.retryCount || 0) + 1;
+        task.lastError = task.message || task.lastError || '';
+        publish(task, 'resume', {
+          message: `已请求继续执行，将从 ${task.failedStage || task.resumeStage || '最近可恢复阶段'} 开始`,
+          failedStage: task.failedStage || '',
+          retryCount: task.retryCount,
+          task: publicTask(task),
+        });
+        sendJson(res, 202, publicTask(task));
+        setImmediate(() => executeWorkflow(task));
         return;
       }
       if (action === 'clarifications' && req.method === 'POST') {

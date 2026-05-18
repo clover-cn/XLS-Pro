@@ -52,6 +52,11 @@ button:disabled {
   font-weight: 700;
 }
 
+.compact-action {
+  padding-inline: 12px;
+  white-space: nowrap;
+}
+
 .app-shell {
   min-height: 100vh;
   font-family: Inter, "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
@@ -363,9 +368,9 @@ button:disabled {
   text-shadow: 0 0 4px rgba(252, 165, 165, 0.3);
 }
 
-.log-state-indexing, .log-state-index_progress, .log-state-index_ready, .log-state-validation,
+.log-state-indexing, .log-state-index_progress, .log-state-index_ready, .log-state-validation, .log-state-classify_progress, .log-state-resume,
 .log-state-exploring_data, .log-state-tool_call, .log-state-tool_result, .log-state-agent_summary,
-.log-state-executing, .log-state-generating_code, .log-state-repairing {
+.log-state-classifying, .log-state-executing, .log-state-generating_code, .log-state-repairing, .log-state-validating_output {
   color: #fde047;
   text-shadow: 0 0 4px rgba(253, 224, 71, 0.3);
 }
@@ -462,8 +467,10 @@ button:disabled {
 .state-executing,
 .state-indexing,
 .state-exploring_data,
+.state-classifying,
 .state-generating_code,
-.state-repairing {
+.state-repairing,
+.state-validating_output {
   background: #fff2c9;
   color: #7a5700;
 }

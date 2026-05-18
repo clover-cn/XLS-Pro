@@ -30,6 +30,33 @@ function createWorkflow({
     fs.writeFileSync(scriptPath, `${code.trim()}\n`, 'utf8');
     return scriptPath;
   }
+
+  function loadGeneratedCode(task) {
+    if (task.generatedCode) return task.generatedCode;
+    const scriptPath = path.join(task.dir, 'generated.py');
+    if (!fs.existsSync(scriptPath)) return '';
+    const code = fs.readFileSync(scriptPath, 'utf8');
+    task.generatedCode = code;
+    return code;
+  }
+
+  function existingOutputPath(task) {
+    if (task.outputPath && fs.existsSync(task.outputPath)) return task.outputPath;
+    const output = path.join(task.dir, 'output.xlsx');
+    if (fs.existsSync(output)) {
+      task.outputPath = output;
+      return output;
+    }
+    return '';
+  }
+
+  function hasUsableAgentPlan(task) {
+    return task.agentPlan?.status === 'ready';
+  }
+
+  function isRetrying(task) {
+    return Boolean(task.retrying);
+  }
   
   function ensureSandboxInputFile(task) {
     const sourcePath = path.resolve(task.filePath);
@@ -248,11 +275,43 @@ function createWorkflow({
   async function executeWorkflow(task) {
     try {
       assertTaskNotCancelled(task);
-      log('info', 'workflow_started', { taskId: task.id, filename: task.filename });
+      const resumeFailedStage = task.failedStage || '';
+      log('info', 'workflow_started', {
+        taskId: task.id,
+        filename: task.filename,
+        retryCount: task.retryCount || 0,
+        failedStage: resumeFailedStage,
+      });
+
+      if (isRetrying(task)) {
+        publish(task, 'resume', {
+          message: `继续执行任务：从 ${resumeFailedStage || task.resumeStage || '最近可恢复阶段'} 开始`,
+          failedStage: resumeFailedStage,
+          retryCount: task.retryCount || 0,
+          task: publicTask(task),
+        });
+      }
+
+      if (!task.metadata) {
+        assertTaskNotCancelled(task);
+        setTaskState(task, 'metadata_ready', '正在解析元数据');
+        task.metadata = await extractMetadata(task.filePath, task.filename, task.previewRows);
+        log('info', 'metadata_extracted', {
+          taskId: task.id,
+          columns: task.metadata.columns.length,
+          totalRows: task.metadata.totalRows,
+          fileKind: task.metadata.fileKind,
+          previewRows: task.metadata.previewRows,
+        });
+        setTaskState(task, 'metadata_ready', '元数据解析完成');
+      }
 
       assertTaskNotCancelled(task);
-      setTaskState(task, 'exploring_data', '正在基于预览判断是否可直接处理');
-      const hasMetadataPlan = tryPlanFromMetadata(task);
+      let hasMetadataPlan = hasUsableAgentPlan(task);
+      if (!hasMetadataPlan) {
+        setTaskState(task, 'exploring_data', '正在基于预览判断是否可直接处理');
+        hasMetadataPlan = tryPlanFromMetadata(task);
+      }
 
       if (!hasMetadataPlan && task.indexStatus !== 'ready') {
         const manifestPath = path.join(task.indexDir || path.join(task.dir, 'index'), 'manifest.json');
@@ -301,9 +360,11 @@ function createWorkflow({
       }
   
       assertTaskNotCancelled(task);
-      if (!hasMetadataPlan) {
-        setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
-        task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
+      if (!hasMetadataPlan && !hasUsableAgentPlan(task)) {
+        if (!task.retrievedRules || !task.retrievedRules.length) {
+          setTaskState(task, 'retrieving_rules', '正在召回知识库规则');
+          task.retrievedRules = retrieveRules(task.metadata, task.requirement, task.temporaryRules);
+        }
   
         assertTaskNotCancelled(task);
         setTaskState(task, 'exploring_data', '模型正在调用工具读取和搜索表格');
@@ -351,10 +412,31 @@ function createWorkflow({
       }
   
       assertTaskNotCancelled(task);
-      setTaskState(task, 'generating_code', '正在生成 Python 处理脚本');
-      writeGeneratedCode(task, await generateCode(task));
-      log('info', 'code_generated', { taskId: task.id, codeLength: task.generatedCode.length });
-      publish(task, 'code', { code: task.generatedCode });
+      const outputForValidation = resumeFailedStage === 'validating_output' ? existingOutputPath(task) : '';
+      if (outputForValidation) {
+        setTaskState(task, 'validating_output', '正在校验输出文件');
+        task.validationReport = await validateOutput(task, outputForValidation);
+        publish(task, 'validation', {
+          message: task.validationReport.ok ? '输出文件校验完成' : '输出文件校验发现问题',
+          report: task.validationReport,
+          task: publicTask(task),
+        });
+        setTaskState(task, 'completed', task.executionWarning ? '处理完成，可下载结果（执行有警告）' : '处理完成，可下载结果');
+        return;
+      }
+
+      const existingCode = loadGeneratedCode(task);
+      if (existingCode) {
+        publish(task, 'resume', {
+          message: '复用已生成的 Python 脚本，直接继续沙盒执行',
+          task: publicTask(task),
+        });
+      } else {
+        setTaskState(task, 'generating_code', '正在生成 Python 处理脚本');
+        writeGeneratedCode(task, await generateCode(task));
+        log('info', 'code_generated', { taskId: task.id, codeLength: task.generatedCode.length });
+        publish(task, 'code', { code: task.generatedCode });
+      }
   
       let lastError = '';
       for (let attempt = 0; attempt <= REPAIR_LIMIT; attempt += 1) {
@@ -364,6 +446,7 @@ function createWorkflow({
         if (result.ok) {
           task.outputPath = result.output;
           task.executionWarning = result.warning || '';
+          setTaskState(task, 'validating_output', '正在校验输出文件');
           task.validationReport = await validateOutput(task, result.output);
           publish(task, 'validation', {
             message: task.validationReport.ok ? '输出文件校验完成' : '输出文件校验发现问题',
@@ -405,6 +488,8 @@ function createWorkflow({
       if (task.state === 'indexing') task.indexStatus = 'failed';
       log('error', 'workflow_failed', { taskId: task.id, error: error.message });
       setTaskState(task, 'failed', error.message);
+    } finally {
+      if (task.state !== 'failed') task.retrying = false;
     }
   }
 

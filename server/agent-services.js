@@ -998,6 +998,7 @@ function createAgentServices({
   function applyAgentPlan(task, plan) {
     task.agentPlan = plan;
     task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
+    task.explorationCheckpoint = null;
     publish(task, 'agent_summary', {
       message: task.agentExplorationSummary || '数据探索完成',
       plan,
@@ -1010,7 +1011,8 @@ function createAgentServices({
   }
 
   function tryPlanFromMetadata(task) {
-    task.agentTrace = [];
+    if (task.agentPlan?.status === 'ready') return true;
+    if (!task.explorationCheckpoint) task.agentTrace = [];
     const patchPlan = inferWorkbookPatchPlan(task);
     if (patchPlan) {
       applyAgentPlan(task, patchPlan);
@@ -1142,7 +1144,6 @@ function createAgentServices({
     }
     const model = process.env.OPENAI_MODEL || 'gpt-4o';
     if (tryPlanFromMetadata(task)) return task.agentExplorationSummary;
-    const toolCache = new Map();
     const systemPrompt = [
       '你是一个 Excel 数据探索 Agent。',
       '你必须通过提供的索引工具按需查询当前上传表格，不能假设没有查询过的数据。',
@@ -1158,7 +1159,7 @@ function createAgentServices({
       '当信息足够时，停止调用工具，并只输出一个 JSON 对象，不要输出 Markdown。',
       'JSON 格式：{"status":"ready|needs_clarification","confidence":0-1,"evidence":[{"tool":"工具名","finding":"发现","rows":[行号]}],"needed_columns":["列名"],"implementation_plan":"后续代码生成依据","questions":["需要用户补充的问题"]}',
     ].join('\n');
-    const messages = [
+    const initialMessages = [
       { role: 'system', content: systemPrompt },
       {
         role: 'user',
@@ -1182,17 +1183,39 @@ function createAgentServices({
       },
     ];
   
-    let toolCallCount = 0;
-    const budgetState = {
+    const previousCheckpoint = task.explorationCheckpoint?.phase === 'explore_data'
+      ? task.explorationCheckpoint
+      : null;
+    const messages = previousCheckpoint?.messages || initialMessages;
+    const toolCache = previousCheckpoint?.toolCache instanceof Map ? previousCheckpoint.toolCache : new Map();
+    let toolCallCount = Number(previousCheckpoint?.toolCallCount || 0);
+    const budgetState = previousCheckpoint?.budgetState || {
       activeLimit: AGENT_TOOL_CALL_LIMIT,
       extensionCount: 0,
       pendingNotice: '',
     };
+    const startRound = Number(previousCheckpoint?.nextRound || 0);
+    if (previousCheckpoint) {
+      publish(task, 'resume', {
+        message: `复用工具探索进度，从第 ${startRound + 1} 轮继续`,
+        round: startRound,
+        toolCallCount,
+        task: publicTask(task),
+      });
+    }
     const maxRounds = AGENT_TOOL_CALL_LIMIT
       + (AGENT_TOOL_BUDGET_EXTENSION_CALLS * AGENT_TOOL_BUDGET_EXTENSION_LIMIT)
       + 1;
-    for (let round = 0; round <= maxRounds; round += 1) {
+    for (let round = startRound; round <= maxRounds; round += 1) {
       assertTaskNotCancelled(task);
+      task.explorationCheckpoint = {
+        phase: 'explore_data',
+        messages,
+        toolCache,
+        toolCallCount,
+        budgetState,
+        nextRound: round,
+      };
       if (toolCallCount >= budgetState.activeLimit - AGENT_FORCE_FINAL_REMAINING) {
         const extended = extendToolBudgetIfJustified(task, budgetState, messages, round, '工具预算即将耗尽');
         if (!extended) {
@@ -1379,6 +1402,14 @@ function createAgentServices({
           return requestFinalExplorationJson(task, messages, model, round + 1, '工具预算即将耗尽。', budgetState.activeLimit);
         }
       }
+      task.explorationCheckpoint = {
+        phase: 'explore_data',
+        messages,
+        toolCache,
+        toolCallCount,
+        budgetState,
+        nextRound: round + 1,
+      };
     }
     return requestFinalExplorationJson(task, messages, model, maxRounds + 1, '已达到探索轮次上限。', budgetState.activeLimit);
   }
