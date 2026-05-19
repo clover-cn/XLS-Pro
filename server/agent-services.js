@@ -438,6 +438,13 @@ function createAgentServices({
     if (/\bre\.(?:search|match|findall|sub)\s*\(/.test(code) && /(分类|类别|标签|现金流|情感|归类|判定|活动)/.test(code)) {
       failures.push('禁止用正则对非结构化文本做业务归类');
     }
+    const readsMultiIndexHeader = /read_excel\s*\([\s\S]*?header\s*=\s*\[[^\]]+\]/m.test(code);
+    const writesWithoutIndex = /\.to_excel\s*\([\s\S]*?index\s*=\s*False/m.test(code);
+    const createsMultiIndexColumns = /\b(?:pd\.)?MultiIndex\b|\.from_tuples\s*\(|\.from_product\s*\(/m.test(code);
+    const flattensColumns = /to_flat_index\s*\(|\.columns\s*=\s*(?!pd\.MultiIndex\b)/m.test(code);
+    if ((readsMultiIndexHeader || createsMultiIndexColumns) && writesWithoutIndex && !flattensColumns) {
+      failures.push('读取或创建多级列头后，禁止直接 to_excel(index=False)；必须先把所有输出 DataFrame 的 columns 扁平化为一维唯一字符串');
+    }
     if (failures.length) {
       throw new Error(`生成代码未满足执行合同：${failures.join('；')}`);
     }
@@ -1708,6 +1715,7 @@ function createAgentServices({
       '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
       '禁止创建示例数据、示例文件、dummy 数据，必须处理真实 INPUT_FILE。',
       '禁止在 Python 中用 if/elif/else、正则、str.contains 或关键词包含规则对非结构化文本做业务归类。',
+      '如果读取多行表头或产生 MultiIndex columns，写出 Excel 前必须先把每个输出 DataFrame 的 columns 扁平化为一维唯一字符串。',
     ].join('\n');
     const prompt = [
       '请严格按以下执行合同生成 Python 源码，并包裹在唯一的 Markdown Python 代码块中。',
@@ -1721,6 +1729,7 @@ function createAgentServices({
       '- 禁止创建示例输入文件、示例 DataFrame、dummy/Alice/Bob/Charlie 数据。',
       '- 禁止在 Python 代码中使用 if/elif/else、正则表达式、str.contains 或关键词表对“摘要/备注/评论/描述/科目名称”等非结构化文本做业务归类。',
       '- 如果任务需要语义分类，必须依赖 agent_plan.semanticPlan 中给出的映射结果；代码只能负责读取、匹配、贴标、计算和输出。',
+      '- 所有写入 Excel 的 DataFrame 必须是一维列名；如果用 header=[0, 1] 或任何 MultiIndex 表头读取，必须先把 columns 转成一维、唯一、非空字符串。',
       '- 必须 import pandas as pd。',
       '- 必须把结果写入 OUTPUT_FILE，且至少一个 sheet。',
       '',
@@ -1731,8 +1740,13 @@ function createAgentServices({
       '- 不要假设第一行是表头。',
       '- 必须结合 metadata.rawRows、metadata.mergedCells、metadata.detectedHeaderRowNumber 判断真实表头。',
       '- 如果 detectedHeaderRowNumber 有值，优先使用它；读取时注意 pandas header/skiprows 是 0-based。',
-      '- 如果多行表头或合并单元格导致列名为空，应根据 rawRows 合成可用列名。',
+      '- 如果多行表头或合并单元格导致列名为空，应根据 rawRows 合成可用列名；优先读取 header=None 后自行拼接列名，避免直接保留 pandas MultiIndex columns。',
       '- 如果用户指定 Sheet1，优先读取 Sheet1；否则使用 metadata.sheetName。',
+      '',
+      '【Excel 写出要求】',
+      '- 写出前必须保证每个输出 DataFrame.columns 都是普通 Index，不是 MultiIndex。',
+      '- 列名必须扁平化为字符串，例如“期末余额_贷方”；重复列名必须加后缀保证唯一。',
+      '- 禁止把 MultiIndex columns 的 DataFrame 直接传给 to_excel(index=False)。',
       '',
       '【失败方式】',
       '- 如果缺少完成需求所需的列，raise ValueError，错误中说明缺少列和当前列名。',
@@ -1777,10 +1791,11 @@ function createAgentServices({
       '禁止导入或使用 os、sys、pathlib、subprocess、requests、socket、urllib、http、shutil、ctypes。',
       '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
       '禁止创建示例数据或示例文件。',
+      '如果代码读取多行表头或产生 MultiIndex columns，写出 Excel 前必须先把所有输出 DataFrame 的 columns 扁平化为一维唯一字符串。',
     ].join('\n');
     const modelText = await callOpenAiCompatible([
       { role: 'system', content: repairSystemPrompt },
-      { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nworkbook_profile = ${JSON.stringify(task.workbookProfile || {})}\nuser_requirement = ${task.requirement}\nagent_plan = ${JSON.stringify(task.agentPlan || {})}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(compactAgentToolTraceForCode(task.agentTrace || []))}` },
+      { role: 'user', content: `请修复以下代码。整个回复只能是一个 Markdown Python 代码块。\n\n【执行合同】\n- 整个回复只能是一个 \`\`\`python 代码块，代码块外不能有任何文字。\n- 必须使用 INPUT_FILE 和 OUTPUT_FILE，禁止重新赋值。\n- 禁止硬编码 input.xlsx/output.xlsx。\n- 禁止导入 os/sys/pathlib/subprocess/requests/socket/urllib/http/shutil/ctypes。\n- 禁止调用 globals/locals/open/eval/exec/compile/__import__。\n- 禁止示例数据，必须处理真实上传文件。\n- 必须 import pandas as pd。\n- 写出 Excel 前必须保证所有输出 DataFrame.columns 是一维唯一字符串；如果原代码使用 header=[0, 1] 或 MultiIndex columns，必须先扁平化列名。\n- 禁止把 MultiIndex columns 的 DataFrame 直接 to_excel(index=False)。\n\n【原代码】\n${task.generatedCode}\n\n【报错】\n${traceback}\n\n【上下文】\nmetadata_json = ${JSON.stringify(task.metadata)}\nworkbook_profile = ${JSON.stringify(task.workbookProfile || {})}\nuser_requirement = ${task.requirement}\nagent_plan = ${JSON.stringify(task.agentPlan || {})}\nagent_exploration_summary = ${task.agentExplorationSummary || '无'}\nagent_tool_trace = ${JSON.stringify(compactAgentToolTraceForCode(task.agentTrace || []))}` },
     ], 0, { taskId: task.id, phase: 'repair_code' });
     const code = extractCodeBlock(modelText);
     if (!code || isSuspiciousGeneratedCode(code)) {

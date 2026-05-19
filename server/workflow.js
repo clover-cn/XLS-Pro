@@ -397,6 +397,10 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
       report: task.validationReport,
       task: publicTask(task),
     });
+    if (!task.validationReport.ok) {
+      setTaskState(task, 'failed', validationFailureMessage(task.validationReport));
+      return;
+    }
     setTaskState(task, 'completed', task.executionWarning ? '处理完成，可下载结果（执行有警告）' : '处理完成，可下载结果');
   }
   
@@ -437,6 +441,12 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         sandboxInput = ensureSandboxInputFile(task);
       } catch (error) {
         resolve({ ok: false, error: error.message });
+        return;
+      }
+      try {
+        if (fs.existsSync(output)) fs.unlinkSync(output);
+      } catch (error) {
+        resolve({ ok: false, error: `清理旧输出文件失败: ${error.message}` });
         return;
       }
       log('info', 'sandbox_started', {
@@ -483,26 +493,23 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
             return;
           }
           if (fs.existsSync(output)) {
-            const warning = [parsed.error, parsed.detail || stderr].filter(Boolean).join('\n').trim();
-            log('warn', 'sandbox_output_accepted_with_warning', {
+            log('warn', 'sandbox_failed_output_rejected', {
               taskId: task.id,
               output,
-              warning: warning.slice(0, 500),
+              error: parsed.error || '',
+              detail: (parsed.detail || stderr || '').slice(0, 500),
             });
-            resolve({ ok: true, output, warning });
-            return;
           }
           resolve({ ok: false, error: parsed.error, detail: parsed.detail || stderr });
         } catch (error) {
           if (fs.existsSync(output)) {
-            const warning = (stderr || stdout || error.message || '沙盒输出解析失败').trim();
-            log('warn', 'sandbox_unparseable_output_accepted', {
+            log('warn', 'sandbox_unparseable_output_rejected', {
               taskId: task.id,
               output,
-              warning: warning.slice(0, 500),
+              error: error.message,
+              stdout: stdout.slice(0, 500),
+              stderr: stderr.slice(0, 500),
             });
-            resolve({ ok: true, output, warning });
-            return;
           }
           log('error', 'sandbox_parse_failed', {
             taskId: task.id,
@@ -588,6 +595,10 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
       });
     });
   }
+
+  function validationFailureMessage(report) {
+    return (report?.warnings || []).join('\n').trim() || '输出文件校验失败';
+  }
   
   async function validateOutput(task, outputPath) {
     const report = {
@@ -602,12 +613,16 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     }
     try {
       const metadata = await extractMetadata(outputPath, 'output.xlsx', 10);
-      report.ok = true;
       report.sheets = (metadata.sheetNames || [metadata.sheetName]).filter(Boolean);
       report.totalRows = metadata.totalRows;
       report.totalColumns = metadata.totalColumns;
       if (!report.sheets.length) report.warnings.push('输出文件没有工作表');
-      if (!metadata.totalRows) report.warnings.push('默认工作表没有数据行');
+      if (!metadata.totalRows || Number(metadata.totalRows) <= 1) report.warnings.push('默认工作表没有有效数据行');
+      if (!metadata.totalColumns || Number(metadata.totalColumns) <= 0) report.warnings.push('默认工作表没有有效列');
+      if (Number(metadata.totalRows) <= 1 && Number(metadata.totalColumns) <= 1) {
+        report.warnings.push('输出文件疑似为空或执行失败残留文件');
+      }
+      report.ok = report.warnings.length === 0;
     } catch (error) {
       report.warnings.push(`输出文件校验失败: ${error.message}`);
     }
@@ -743,6 +758,10 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
           report: task.validationReport,
           task: publicTask(task),
         });
+        if (!task.validationReport.ok) {
+          setTaskState(task, 'failed', validationFailureMessage(task.validationReport));
+          return;
+        }
         log('info', 'workflow_completed', {
           taskId: task.id,
           mode: 'workbook_patch',
@@ -773,6 +792,10 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
           report: task.validationReport,
           task: publicTask(task),
         });
+        if (!task.validationReport.ok) {
+          setTaskState(task, 'failed', validationFailureMessage(task.validationReport));
+          return;
+        }
         setTaskState(task, 'completed', task.executionWarning ? '处理完成，可下载结果（执行有警告）' : '处理完成，可下载结果');
         return;
       }
@@ -805,6 +828,16 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
             report: task.validationReport,
             task: publicTask(task),
           });
+          if (!task.validationReport.ok) {
+            lastError = validationFailureMessage(task.validationReport);
+            publish(task, 'error', { message: lastError, attempt });
+            if (attempt < REPAIR_LIMIT && process.env.OPENAI_API_KEY) {
+              const fixed = await repairCode(task, lastError);
+              if (fixed) writeGeneratedCode(task, fixed);
+              continue;
+            }
+            break;
+          }
           if (task.executionWarning) {
             publish(task, 'warning', {
               message: `结果文件已生成，但执行过程中出现警告：${task.executionWarning}`,

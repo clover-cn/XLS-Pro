@@ -6,6 +6,7 @@
     "api": "node server/index.js",
     "test:excel-tools": "node scripts/test-excel-tools.js",
     "test:workbook-patch": "node scripts/test-workbook-patch.js",
+    "test:workflow-guards": "node scripts/test-workflow-guards.js",
     "test:task": "node scripts/test-task-run.js",
     "serve": "vue-cli-service serve",
     "build": "vue-cli-service build",
