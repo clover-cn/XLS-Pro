@@ -1,4 +1,5 @@
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -53,6 +54,50 @@ function runTool(indexDir, toolName, args) {
   return runPython(['tool', indexDir, toolName, JSON.stringify(args)]);
 }
 
+function createMultiSheetEmptyFixture(filePath) {
+  const script = [
+    'import sys',
+    'from openpyxl import Workbook',
+    'path = sys.argv[1]',
+    'workbook = Workbook()',
+    'sheet1 = workbook.active',
+    'sheet1.title = "Sheet1"',
+    'sheet1.append(["科目", "金额"])',
+    'sheet1.append(["银行存款", 100])',
+    'workbook.create_sheet("Sheet2")',
+    'workbook.save(path)',
+  ].join('\n');
+  const result = spawnSync(PYTHON_BIN, ['-c', script, filePath], {
+    cwd: ROOT,
+    encoding: 'utf8',
+    env: { ...process.env, PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.status !== 0) {
+    throw new Error(`生成多 Sheet 测试文件失败，退出码 ${result.status}`);
+  }
+}
+
+function verifyMultiSheetEmptyIndex() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'excel-tools-multisheet-'));
+  const workbookPath = path.join(tempDir, 'multisheet-empty.xlsx');
+  const indexDir = path.join(tempDir, 'index');
+  createMultiSheetEmptyFixture(workbookPath);
+
+  const manifest = buildIndex(workbookPath, indexDir);
+  if (manifest.sheets?.length !== 2) throw new Error('多 Sheet 工作簿未完整索引');
+  const emptySheet = manifest.sheets.find((sheet) => sheet.sheetName === 'Sheet2');
+  if (!emptySheet) throw new Error('未索引空 Sheet2');
+  if (emptySheet.detectedHeaderRowNumber !== null) throw new Error('空 Sheet 不应推断表头行');
+
+  const listed = runTool(indexDir, 'excel_list_sheets', {});
+  if (listed.sheets?.length !== 2) throw new Error('excel_list_sheets 未返回全部工作表');
+
+  const rows = runTool(indexDir, 'excel_read_rows', { sheetName: 'Sheet2', startRow: 1, endRow: 1 });
+  if (rows.rows?.length !== 0) throw new Error('空 Sheet 不应返回数据行');
+}
+
 function main() {
   const filePath = path.resolve(ROOT, argValue('--file', path.join('samples', 'demo-ledger.csv')));
   if (!fs.existsSync(filePath)) throw new Error(`文件不存在: ${filePath}`);
@@ -76,6 +121,8 @@ function main() {
 
   const aggregate = runTool(indexDir, 'excel_aggregate', { column: '金额', operation: 'sum' });
   if (!aggregate.rows?.length) throw new Error('aggregate 未返回结果');
+
+  verifyMultiSheetEmptyIndex();
 
   console.log('excel tools smoke passed');
 }

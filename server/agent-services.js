@@ -37,12 +37,12 @@ function createAgentServices({
     }
     return JSON.stringify(value);
   }
-  
+
   function normalizedNumber(value) {
     const number = Number(value);
     return Number.isFinite(number) ? number : value;
   }
-  
+
   function normalizeToolArgs(toolName, args = {}) {
     const sheetName = args.sheetName ? String(args.sheetName).trim() : '';
     if (toolName === 'excel_list_sheets') return {};
@@ -94,11 +94,11 @@ function createAgentServices({
     }
     return args || {};
   }
-  
+
   function toolCacheKey(toolName, args) {
     return `${toolName}:${stableStringify(normalizeToolArgs(toolName, args))}`;
   }
-  
+
   function findCachedToolResult(toolCache, toolName, args) {
     const exact = toolCache.get(toolCacheKey(toolName, args));
     if (exact) return { ...exact, cacheKind: 'exact' };
@@ -139,7 +139,7 @@ function createAgentServices({
       resultSummary: cacheHit.resultSummary,
     };
   }
-  
+
   function toolPriority(toolName, args = {}) {
     if (toolName === 'excel_list_sheets') return 100;
     if (toolName === 'excel_get_schema') return 90;
@@ -150,7 +150,7 @@ function createAgentServices({
     if (toolName === 'excel_sample_rows') return 40;
     return 0;
   }
-  
+
   function budgetSkippedToolContent(toolName, reason, remainingBudget) {
     return {
       ok: false,
@@ -163,7 +163,7 @@ function createAgentServices({
         : '本轮只执行最高价值工具。请基于已有证据判断，下一轮如必须调用工具，只请求一个最关键工具。',
     };
   }
-  
+
   function summarizeModelMessages(messages) {
     return messages.map((message) => ({
       role: message.role,
@@ -177,7 +177,7 @@ function createAgentServices({
       })),
     }));
   }
-  
+
   function summarizeModelRequest(requestBody) {
     return {
       model: requestBody.model,
@@ -188,11 +188,11 @@ function createAgentServices({
       messages: summarizeModelMessages(requestBody.messages || []),
     };
   }
-  
+
   function shouldPassReasoningContent(model) {
     return /deepseek/i.test(model || '');
   }
-  
+
   function toAssistantHistoryMessage(message, model) {
     const historyMessage = {
       role: 'assistant',
@@ -206,14 +206,14 @@ function createAgentServices({
     }
     return historyMessage;
   }
-  
+
   function requiresAccountingClarification(requirement) {
     const text = String(requirement || '');
     const asksTableIdentity = /是什么表|什么表|有什么用|用途|表格用途|结构概览|整体概览|识别.*表/i.test(text);
     const asksStructuredCalculation = /计算|统计|求和|汇总|合计|总计|金额|收入|支出|借方|贷方|交易|流水|账|账单|往来|应收|应付|日期|时间|按月|按日|分类|筛选|多少|占比|比例/i.test(text);
     return asksStructuredCalculation && !asksTableIdentity;
   }
-  
+
   function needsClarification(task) {
     if (!requiresAccountingClarification(task.requirement)) return [];
     const headers = [
@@ -387,7 +387,7 @@ function createAgentServices({
     }
     return kept.slice(-8);
   }
-  
+
   function isSuspiciousGeneratedCode(code) {
     const patterns = [
       /(?:^|\n)\s*INPUT_FILE\s*=/,
@@ -405,7 +405,7 @@ function createAgentServices({
     ];
     return patterns.some((pattern) => pattern.test(code));
   }
-  
+
   function validateGeneratedCodeContract(code) {
     const failures = [];
     if (!/^\s*(import\s+pandas\s+as\s+pd|from\s+pandas\s+import\s+)/m.test(code)) {
@@ -442,7 +442,7 @@ function createAgentServices({
       throw new Error(`生成代码未满足执行合同：${failures.join('；')}`);
     }
   }
-  
+
   async function callOpenAiCompatible(messages, temperature = 0.1, context = {}, options = {}) {
     if (!process.env.OPENAI_API_KEY) return null;
     const ownerTask = context.taskId ? tasks.get(context.taskId) : null;
@@ -481,7 +481,7 @@ function createAgentServices({
       if (ownerTask?.abortController === controller) ownerTask.abortController = null;
       throw new Error(`模型调用失败 ${response.status}: ${detail.slice(0, 500)}`);
     }
-  
+
     if (!stream) {
       const data = await response.json();
       const message = data.choices && data.choices[0] && data.choices[0].message;
@@ -515,7 +515,7 @@ function createAgentServices({
       if (ownerTask?.abortController === controller) ownerTask.abortController = null;
       return options.returnMessage ? message : (message?.content || '');
     }
-  
+
     const contentType = response.headers.get('content-type') || '';
     if (!response.body || !contentType.includes('text/event-stream')) {
       const data = await response.json();
@@ -535,14 +535,14 @@ function createAgentServices({
       if (ownerTask?.abortController === controller) ownerTask.abortController = null;
       return content;
     }
-  
+
     const decoder = new TextDecoder('utf-8');
     const reader = response.body.getReader();
     let buffer = '';
     let content = '';
     let reasoningChars = 0;
     let sawFirstChunk = false;
-  
+
     const consumeSseData = (rawData) => {
       if (!rawData || rawData === '[DONE]') return;
       try {
@@ -566,7 +566,7 @@ function createAgentServices({
         log('warn', 'model_stream_chunk_parse_failed', { ...context, error: error.message, chunk: rawData.slice(0, 200) });
       }
     };
-  
+
     while (true) {
       let chunk;
       try {
@@ -590,7 +590,7 @@ function createAgentServices({
         }
       }
     }
-  
+
     if (buffer.trim()) {
       for (const line of buffer.split(/\r?\n/)) {
         if (line.startsWith('data:')) {
@@ -598,7 +598,7 @@ function createAgentServices({
         }
       }
     }
-  
+
     log('info', 'model_stream_completed', {
       ...context,
       model,
@@ -610,13 +610,13 @@ function createAgentServices({
     if (ownerTask?.abortController === controller) ownerTask.abortController = null;
     return content;
   }
-  
+
   function extractCodeBlock(text) {
     if (!text) return '';
     const match = /```(?:python)?\s*([\s\S]*?)```/i.exec(text);
     return match ? match[1].trim() : '';
   }
-  
+
   function withToolReasonParameters(parameters) {
     const required = Array.isArray(parameters.required) ? parameters.required : [];
     return {
@@ -788,7 +788,7 @@ function createAgentServices({
       },
     },
   ];
-  
+
   function parseToolArguments(rawArguments) {
     if (!rawArguments) return {};
     try {
@@ -797,12 +797,12 @@ function createAgentServices({
       throw new Error(`工具参数不是合法 JSON: ${error.message}`);
     }
   }
-  
+
   function isFatalExcelToolError(error) {
     const message = error?.message || String(error || '');
     return /Unable to create process|spawn .*ENOENT|duckdb 不可用|openpyxl 不可用|Excel 工具输出无法解析|索引不存在/i.test(message);
   }
-  
+
   function toolErrorData(error, toolName) {
     const message = error?.message || String(error || '工具调用失败');
     return {
@@ -812,7 +812,7 @@ function createAgentServices({
       guidance: '这是一次可恢复的工具错误。请根据错误信息调整参数后继续调用工具，例如缩小读取行范围、改用搜索定位行号，或指定正确的工作表名称。',
     };
   }
-  
+
   function parseDsmlToolCalls(content) {
     if (!content || !content.includes('DSML') || !content.includes('invoke')) return [];
     const calls = [];
@@ -841,7 +841,7 @@ function createAgentServices({
     }
     return calls;
   }
-  
+
   function extractJsonObject(text) {
     if (!text) return null;
     const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
@@ -870,7 +870,7 @@ function createAgentServices({
       return [];
     }
   }
-  
+
   function buildWorkbookIndex(task) {
     return new Promise((resolve, reject) => {
       try {
@@ -962,7 +962,7 @@ function createAgentServices({
       });
     });
   }
-  
+
   function runExcelTool(task, toolName, args) {
     return new Promise((resolve, reject) => {
       try {
@@ -1019,7 +1019,7 @@ function createAgentServices({
       });
     });
   }
-  
+
   function applyAgentPlan(task, plan) {
     task.agentPlan = plan;
     task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
@@ -1050,7 +1050,7 @@ function createAgentServices({
     }
     return false;
   }
-  
+
   function totalRowsFromTask(task) {
     const metadataRows = Number(task.metadata?.totalRows || 0);
     const indexedRows = (task.workbookProfile?.sheets || []).reduce(
@@ -1162,7 +1162,7 @@ function createAgentServices({
     }
     throw new Error('模型未能在工具预算内输出合法探索 JSON');
   }
-  
+
   async function exploreDataWithTools(task) {
     if (!process.env.OPENAI_API_KEY) {
       throw new Error('缺少 OPENAI_API_KEY，无法执行模型工具调用探索');
@@ -1207,7 +1207,7 @@ function createAgentServices({
         ].join('\n'),
       },
     ];
-  
+
     const previousCheckpoint = task.explorationCheckpoint?.phase === 'explore_data'
       ? task.explorationCheckpoint
       : null;
@@ -1281,9 +1281,9 @@ function createAgentServices({
         }
         return applyAgentPlan(task, plan);
       }
-  
+
       messages.push(toAssistantHistoryMessage(message, model));
-  
+
       const parsedToolCalls = toolCalls.map((toolCall, index) => {
         let rawArgs = {};
         let argumentError = null;
@@ -1323,7 +1323,7 @@ function createAgentServices({
           .slice(0, Math.max(0, Math.min(remainingBeforeRound, AGENT_TOOL_CALLS_PER_ROUND)))
           .map((item) => item.index),
       );
-  
+
       let forceFinalReason = '';
       for (const item of parsedToolCalls) {
         assertTaskNotCancelled(task);
@@ -1342,7 +1342,7 @@ function createAgentServices({
           args: traceItem.args,
           task: publicTask(task),
         });
-  
+
         let toolContent;
         try {
           if (argumentError) throw argumentError;
@@ -1439,12 +1439,54 @@ function createAgentServices({
     return requestFinalExplorationJson(task, messages, model, maxRounds + 1, '已达到探索轮次上限。', budgetState.activeLimit);
   }
 
-  function defaultSemanticSubjects(task) {
+  function availableColumnNames(task) {
     const columns = task.metadata?.columns || [];
-    const names = columns.map((column) => column.name).filter(Boolean);
+    return columns.map((column) => column.name).filter(Boolean);
+  }
+
+  function pickExistingColumns(names, preferred) {
+    return preferred.filter((column) => names.includes(column));
+  }
+
+  function stableSemanticDomain(task, proposedDomain) {
+    const requirement = String(task.requirement || '');
+    const proposed = String(proposedDomain || '').trim().toLowerCase();
+    if (/现金流量表|现金流/.test(requirement) || /cash[_\s-]*flow|cashflow|现金/.test(proposed)) return 'cash_flow';
+    if (/情感|评价|评论|满意|差评|好评/.test(requirement) || /sentiment/.test(proposed)) return 'sentiment';
+    if (/风险|异常|可疑/.test(requirement) || /risk|fraud|异常/.test(proposed)) return 'risk';
+    if (/凭证|序时账|科目|财务|审计/.test(requirement) || /finance|audit|ledger|财务|审计/.test(proposed)) return 'finance';
+    return 'general';
+  }
+
+  function taxonomyVersionFor(domain, taxonomy) {
+    if (domain === 'cash_flow') return 'cash-flow-v1';
+    if (domain === 'sentiment') return 'sentiment-v1';
+    if (domain === 'risk') return 'risk-v1';
+    const labels = (Array.isArray(taxonomy) ? taxonomy : [])
+      .map((label) => String(label).trim())
+      .filter(Boolean);
+    if (!labels.length) return 'default-v1';
+    return `taxonomy-${crypto.createHash('sha1').update(labels.join('\n')).digest('hex').slice(0, 12)}`;
+  }
+
+  function stableSemanticSubjects(task, requestedColumns = []) {
+    const names = availableColumnNames(task);
+    const requirement = String(task.requirement || '');
+    if (/现金流量表|现金流|凭证|序时账|科目/.test(requirement)) {
+      const ledgerColumns = pickExistingColumns(names, ['科目编码', '科目', '摘要']);
+      if (ledgerColumns.length) return ledgerColumns;
+    }
     const preferred = ['摘要', '备注', '评论', '内容', '描述', '科目', '名称', '客户', '供应商', '用途'];
     const matched = names.filter((name) => preferred.some((token) => String(name).includes(token)));
-    return matched.slice(0, 4);
+    if (matched.length) return matched.slice(0, 4);
+    const requested = (Array.isArray(requestedColumns) ? requestedColumns : [requestedColumns]).filter(Boolean);
+    const existingRequested = names.filter((name) => requested.includes(name));
+    if (existingRequested.length) return existingRequested.slice(0, 4);
+    return names.slice(0, 3);
+  }
+
+  function defaultSemanticSubjects(task) {
+    return stableSemanticSubjects(task);
   }
 
   function defaultTaxonomy(requirement) {
@@ -1482,21 +1524,23 @@ function createAgentServices({
     const requirement = String(task.requirement || '');
     const semanticRequired = /分类|归类|标签|打标|识别|判断|情感|评论|摘要|现金流量表|现金流|风险|异常|主观|语义/i.test(requirement);
     const hybrid = /现金流量表|现金流|凭证|序时账|勾稽|对方科目/i.test(requirement);
+    const domain = stableSemanticDomain(task, hybrid ? 'cash_flow' : 'general');
+    const taxonomy = defaultTaxonomy(requirement);
     return {
       status: 'ready',
       route: {
         task_type: semanticRequired ? (hybrid ? 'hybrid' : 'semantic_mapping') : 'deterministic',
         semantic_required: semanticRequired,
-        domain_hint: hybrid ? 'cash_flow' : 'general',
+        domain_hint: domain,
         confidence: semanticRequired ? 0.72 : 0.68,
         reason: semanticRequired
           ? '需求包含分类、标签、摘要理解或业务语义判断，不能只依赖代码规则。'
           : '需求看起来主要是结构化计算、筛选或聚合。',
       },
       semanticPlan: semanticRequired ? {
-        subject_columns: defaultSemanticSubjects(task),
-        taxonomy: defaultTaxonomy(requirement),
-        taxonomy_version: hybrid ? 'cash-flow-v1' : 'default-v1',
+        subject_columns: stableSemanticSubjects(task),
+        taxonomy,
+        taxonomy_version: taxonomyVersionFor(domain, taxonomy),
         prompt_version: 'semantic-mapping-v1',
       } : null,
     };
@@ -1510,23 +1554,29 @@ function createAgentServices({
       ? Boolean(route.semantic_required)
       : ['semantic', 'semantic_mapping', 'hybrid'].includes(taskType);
     const semanticPlan = rawPlan?.semanticPlan || rawPlan?.semantic_plan || fallback.semanticPlan || {};
+    const proposedDomain = route.domain_hint || route.domain || fallback.route.domain_hint || 'general';
+    const domain = stableSemanticDomain(task, proposedDomain);
     const subjectColumns = semanticPlan.subject_columns || semanticPlan.semantic_subjects || semanticPlan.columns || fallback.semanticPlan?.subject_columns || [];
-    const taxonomy = semanticPlan.taxonomy || semanticPlan.labels || fallback.semanticPlan?.taxonomy || defaultTaxonomy(task.requirement);
+    const proposedTaxonomy = semanticPlan.taxonomy || semanticPlan.labels || fallback.semanticPlan?.taxonomy || defaultTaxonomy(task.requirement);
+    const taxonomy = ['cash_flow', 'sentiment', 'risk'].includes(domain)
+      ? defaultTaxonomy(task.requirement)
+      : proposedTaxonomy;
+    const stableSubjects = stableSemanticSubjects(task, subjectColumns);
     return {
       status: 'ready',
       route: {
         task_type: semanticRequired && taskType === 'semantic' ? 'semantic_mapping' : taskType,
         semantic_required: semanticRequired,
-        domain_hint: route.domain_hint || route.domain || fallback.route.domain_hint || 'general',
+        domain_hint: domain,
         output_shape: route.output_shape || route.outputShape || '',
         confidence: Number(route.confidence || fallback.route.confidence || 0.5),
         reason: route.reason || fallback.route.reason || '',
       },
       semanticPlan: semanticRequired ? {
-        subject_columns: (Array.isArray(subjectColumns) ? subjectColumns : [subjectColumns]).filter(Boolean).slice(0, 4),
+        subject_columns: stableSubjects,
         taxonomy: (Array.isArray(taxonomy) ? taxonomy : String(taxonomy).split(/[，,、]/)).filter(Boolean).slice(0, 80),
-        taxonomy_version: semanticPlan.taxonomy_version || semanticPlan.taxonomyVersion || fallback.semanticPlan?.taxonomy_version || 'default-v1',
-        prompt_version: semanticPlan.prompt_version || semanticPlan.promptVersion || 'semantic-mapping-v1',
+        taxonomy_version: taxonomyVersionFor(domain, Array.isArray(taxonomy) ? taxonomy : String(taxonomy).split(/[，,、]/)),
+        prompt_version: 'semantic-mapping-v1',
       } : null,
     };
   }
@@ -1546,6 +1596,9 @@ function createAgentServices({
       '- deterministic：结构化筛选、计算、聚合、合并、透视即可完成。',
       '- semantic_mapping：需要理解摘要、备注、评论、描述、名称等文本含义并打标签。',
       '- hybrid：先结构化抽取候选，再语义映射，最后确定性汇总。',
+      'domain_hint 使用稳定短标识，优先从 cash_flow、sentiment、risk、finance、general 中选择。',
+      'subject_columns 只选择真正决定语义归类的列；同一类任务必须保持列集合和顺序稳定。',
+      'taxonomy_version 和 prompt_version 使用稳定版本号，不要每次生成新名称。',
       '',
       '输出 JSON 结构：',
       '{"route":{"task_type":"","semantic_required":true,"domain_hint":"","output_shape":"","confidence":0.0,"reason":""},"semanticPlan":{"subject_columns":["列名"],"taxonomy":["标签"],"taxonomy_version":"default-v1","prompt_version":"semantic-mapping-v1"}}',
@@ -1643,7 +1696,7 @@ function createAgentServices({
     }
     return output;
   }
-  
+
   async function generateCode(task) {
     const systemPrompt = [
       '你是 Python 代码生成器。',
@@ -1655,7 +1708,7 @@ function createAgentServices({
       '禁止调用 globals、locals、open、eval、exec、compile、__import__。',
       '禁止创建示例数据、示例文件、dummy 数据，必须处理真实 INPUT_FILE。',
       '禁止在 Python 中用 if/elif/else、正则、str.contains 或关键词包含规则对非结构化文本做业务归类。',
-      ].join('\n');
+    ].join('\n');
     const prompt = [
       '请严格按以下执行合同生成 Python 源码，并包裹在唯一的 Markdown Python 代码块中。',
       '',
@@ -1714,7 +1767,7 @@ function createAgentServices({
       throw error;
     }
   }
-  
+
   async function repairCode(task, traceback) {
     const repairSystemPrompt = [
       '你是 Python 代码修复器。',

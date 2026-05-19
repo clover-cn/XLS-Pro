@@ -73,6 +73,39 @@ function createWorkflow({
     };
   }
 
+  function cacheFallbackDomainsFor(domain) {
+    if (domain === 'cash_flow') {
+      return ['cash_flow', 'finance_audit', '财务审计', '财务审计：现金流量表编制', '财务审计-现金流量表编制'];
+    }
+    return [domain || 'general'];
+  }
+
+  function semanticKeyAliases(item, subjectColumns) {
+    const aliases = new Set();
+    if (item?.key) aliases.add(String(item.key));
+    const values = item?.sample?.values || {};
+    const entries = Object.entries(values)
+      .filter(([column, value]) => subjectColumns.includes(column) && value !== undefined && value !== null)
+      .map(([column, value]) => [column, String(value).trim()]);
+    if (entries.length < 2 || entries.length > 4) return [...aliases];
+
+    function visit(prefix, remaining) {
+      if (!remaining.length) {
+        const parts = prefix.map(([, value]) => value);
+        if (parts.some((value) => value)) aliases.add(parts.join('\u241f'));
+        return;
+      }
+      for (let index = 0; index < remaining.length; index += 1) {
+        visit([...prefix, remaining[index]], [
+          ...remaining.slice(0, index),
+          ...remaining.slice(index + 1),
+        ]);
+      }
+    }
+    visit([], entries);
+    return [...aliases];
+  }
+
   function runSemanticExtract(task, plan) {
     return new Promise((resolve) => {
       const python = process.env.PYTHON_BIN || 'python';
@@ -228,11 +261,18 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     }
     const extraction = extractionResult.data;
     task.semanticExtraction = extraction;
+    const cacheScope = {
+      domain: plan.domain,
+      taxonomyVersion: plan.taxonomyVersion,
+      promptVersion: plan.promptVersion,
+      subjectColumns: extraction.subjectColumns,
+    };
     publish(task, 'classify_progress', {
       message: `提取到 ${extraction.totalUnique} 个唯一值组合，准备语义映射`,
       phase: 'extract_done',
       total: extraction.totalUnique,
       subjectColumns: extraction.subjectColumns,
+      cacheScope,
       task: publicTask(task),
     });
 
@@ -241,16 +281,40 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
       domain: plan.domain,
       taxonomyVersion: plan.taxonomyVersion,
       promptVersion: plan.promptVersion,
-      keys: items.map((item) => ({ key: item.key })),
+      fallbackDomains: cacheFallbackDomainsFor(plan.domain),
+      keys: items.map((item) => ({
+        key: item.key,
+        aliases: semanticKeyAliases(item, extraction.subjectColumns),
+      })),
     };
-    const cacheHits = semanticCache.lookup(cachePayload).hits || [];
+    let cacheHits = [];
+    try {
+      cacheHits = semanticCache.lookup(cachePayload).hits || [];
+    } catch (error) {
+      log('warn', 'semantic_cache_lookup_failed', {
+        taskId: task.id,
+        error: error.message,
+        cacheScope,
+      });
+      publish(task, 'classify_progress', {
+        message: `语义缓存读取失败，将只分类新增项：${error.message}`,
+        phase: 'cache_lookup_failed',
+        cacheScope,
+        task: publicTask(task),
+      });
+    }
     const hitMap = new Map(cacheHits.map((item) => [item.key, { ...item, source: 'cache' }]));
     const missingItems = items.filter((item) => !hitMap.has(item.key));
+    const exactCacheHits = cacheHits.filter((item) => item.cacheScope !== 'fallback').length;
+    const fallbackCacheHits = cacheHits.length - exactCacheHits;
     publish(task, 'classify_progress', {
-      message: `缓存命中 ${cacheHits.length} 条历史分类，剩余 ${missingItems.length} 条需要 LLM 分类`,
+      message: `缓存命中 ${cacheHits.length} 条历史分类（精确 ${exactCacheHits}，兼容 ${fallbackCacheHits}），剩余 ${missingItems.length} 条需要 LLM 分类`,
       cached: cacheHits.length,
+      exactCached: exactCacheHits,
+      fallbackCached: fallbackCacheHits,
       remaining: missingItems.length,
       total: items.length,
+      cacheScope,
       task: publicTask(task),
     });
 
@@ -258,15 +322,45 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
       subject_columns: extraction.subjectColumns,
       taxonomy: plan.taxonomy,
     });
+    const missingItemByKey = new Map(missingItems.map((item) => [item.key, item]));
+    const cacheableLlmMappings = llmMappings.map((mapping) => {
+      const item = missingItemByKey.get(mapping.key);
+      return {
+        ...mapping,
+        aliases: item ? semanticKeyAliases(item, extraction.subjectColumns) : [mapping.key],
+      };
+    });
     if (llmMappings.length) {
-      semanticCache.upsert({
-        domain: plan.domain,
-        taxonomyVersion: plan.taxonomyVersion,
-        promptVersion: plan.promptVersion,
-        model: process.env.OPENAI_MODEL || '',
-        source: 'llm',
-        mappings: llmMappings,
-      });
+      try {
+        const saved = semanticCache.upsert({
+          domain: plan.domain,
+          taxonomyVersion: plan.taxonomyVersion,
+          promptVersion: plan.promptVersion,
+          model: process.env.OPENAI_MODEL || '',
+          source: 'llm',
+          mappings: cacheableLlmMappings,
+        }).saved || 0;
+        publish(task, 'classify_progress', {
+          message: `语义缓存写入 ${saved}/${llmMappings.length} 条新增分类`,
+          phase: 'cache_upsert_done',
+          saved,
+          total: llmMappings.length,
+          cacheScope,
+          task: publicTask(task),
+        });
+      } catch (error) {
+        log('warn', 'semantic_cache_upsert_failed', {
+          taskId: task.id,
+          error: error.message,
+          cacheScope,
+        });
+        publish(task, 'classify_progress', {
+          message: `语义缓存写入失败，本次结果仍会继续生成：${error.message}`,
+          phase: 'cache_upsert_failed',
+          cacheScope,
+          task: publicTask(task),
+        });
+      }
     }
     const allMappings = [
       ...cacheHits.map((item) => ({ ...item, source: 'cache' })),

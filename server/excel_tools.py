@@ -119,12 +119,15 @@ def best_header_row(raw_rows):
         score = len(non_empty) + keyword_score + data_score
         if score > best[1]:
             best = (index, score)
+    if best[1] <= 0:
+        return None
     return best[0] + 1
 
 
 def make_columns(total_columns, raw_rows):
     header_row = best_header_row(raw_rows)
     header_values = raw_rows[header_row - 1] if header_row and header_row <= len(raw_rows) else []
+    sample_start = header_row if header_row is not None else 0
     columns = []
     seen = {}
     for index in range(total_columns):
@@ -133,7 +136,10 @@ def make_columns(total_columns, raw_rows):
         seen[name] = count
         if count > 1:
             name = f"{name}_{count}"
-        sample_values = [row[index] if index < len(row) else "" for row in raw_rows[header_row: min(len(raw_rows), header_row + 50)]]
+        sample_values = [
+            row[index] if index < len(row) else ""
+            for row in raw_rows[sample_start: min(len(raw_rows), sample_start + 50)]
+        ]
         columns.append({
             "index": index + 1,
             "storageName": f"c{index + 1}",
