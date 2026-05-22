@@ -4,6 +4,7 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
 const { createWorkflow } = require('../server/workflow');
+const { createAgentServices } = require('../server/agent-services');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -112,9 +113,43 @@ async function verifyResidualOutputValidationFails() {
   assert(report.warnings.some((warning) => warning.includes('残留文件')), `应报告残留文件风险，实际为: ${report.warnings.join(';')}`);
 }
 
+function verifyDirectTextEditRoutesToWorkbookPatch() {
+  const services = createAgentServices({
+    tasks: new Map(),
+    log: () => {},
+    publish: () => {},
+    publicTask: (task) => task,
+    assertTaskNotCancelled: () => {},
+    cancelledError: () => new Error('cancelled'),
+    trackChildProcess: () => {},
+    isPathInside,
+  });
+  const task = {
+    id: 'direct-text-edit',
+    requirement: '帮我把“1.7支付杜潇报销费用”改成“1.7支付杜潇报销费用test”，格式保持一致',
+    metadata: {
+      fileKind: 'xlsx',
+      sheetName: 'Sheet1',
+      sheetNames: ['Sheet1'],
+      detectedHeaderRowNumber: 4,
+      rawRows: [{ rowNumber: 4, values: ['日期', '摘要'] }],
+      columns: [{ name: '日期' }, { name: '摘要' }],
+    },
+    agentTrace: [],
+  };
+
+  const planned = services.tryPlanFromMetadata(task);
+  assert(planned === true, '明确文本替换任务应在元数据阶段直接规划');
+  assert(task.agentPlan.executionMode === 'workbook_patch', `应走 workbook_patch，实际为: ${task.agentPlan.executionMode}`);
+  assert(task.agentPlan.workbookPatch.mode === 'text_replace', `应使用 text_replace，实际为: ${task.agentPlan.workbookPatch.mode}`);
+  assert(task.agentPlan.workbookPatch.oldValue === '1.7支付杜潇报销费用', 'oldValue 解析错误');
+  assert(task.agentPlan.workbookPatch.newValue === '1.7支付杜潇报销费用test', 'newValue 解析错误');
+}
+
 async function main() {
   await verifySandboxRejectsFailedResidualOutput();
   await verifyResidualOutputValidationFails();
+  verifyDirectTextEditRoutesToWorkbookPatch();
   console.log('workflow guards passed');
 }
 

@@ -314,7 +314,64 @@ function createAgentServices({
     return { startDate: matches[0], endDate: matches[1] };
   }
 
-  function inferWorkbookPatchPlan(task) {
+  function trimReplacementText(value) {
+    return String(value || '')
+      .replace(/^[\s，。；,：:]+|[\s，。；,：:]+$/g, '')
+      .replace(/\s*(?:格式保持一致|保持原格式|保持格式一致|保持一致|原格式|原表|不改变格式|不改变原格式).*$/g, '')
+      .trim();
+  }
+
+  function extractReplacementPair(requirement) {
+    const text = String(requirement || '');
+    const quoted = [...text.matchAll(/[“"‘'`](.+?)[”"’'`]/g)]
+      .map((match) => trimReplacementText(match[1]))
+      .filter(Boolean);
+    if (quoted.length >= 2) {
+      return { oldValue: quoted[0], newValue: quoted[1] };
+    }
+    const compact = text.replace(/[，。；,]/g, ' ');
+    const match = /(?:请)?(?:把|将)?\s*(.+?)\s*(?:改成|修改为|替换为|变成|设为|置为|填为)\s*(.+)$/i.exec(compact);
+    if (!match) return null;
+    const oldValue = trimReplacementText(match[1]);
+    const newValue = trimReplacementText(match[2]);
+    if (!oldValue || !newValue) return null;
+    if (oldValue.length < 2 || newValue.length < 2) return null;
+    return { oldValue, newValue };
+  }
+
+  function inferTextReplacePatchPlan(task) {
+    const metadata = task.metadata || {};
+    if (metadata.fileKind !== 'xlsx') return null;
+    const requirement = String(task.requirement || '');
+    if (!/改成|修改为|设为|置为|变成|替换为|填为/.test(requirement)) return null;
+    if (/生成|输出|汇总|统计|合计|透视|分类|分组|新增|创建|制作|编制/.test(requirement)) return null;
+    const replacement = extractReplacementPair(requirement);
+    if (!replacement) return null;
+    const patch = {
+      mode: 'text_replace',
+      oldValue: replacement.oldValue,
+      newValue: replacement.newValue,
+    };
+    const evidenceRows = Number(metadata.detectedHeaderRowNumber || 0) ? [Number(metadata.detectedHeaderRowNumber || 0)] : [];
+    return {
+      status: 'ready',
+      confidence: 0.97,
+      evidence: [
+        {
+          tool: 'metadata_preview',
+          finding: `识别为原位文本替换任务：将“${replacement.oldValue}”替换为“${replacement.newValue}”，需要保留原工作簿格式。`,
+          rows: evidenceRows,
+        },
+      ],
+      needed_columns: [],
+      implementation_plan: `复制原工作簿并直接替换所有精确匹配“${replacement.oldValue}”的单元格为“${replacement.newValue}”，不重建工作簿。`,
+      questions: [],
+      executionMode: 'workbook_patch',
+      workbookPatch: patch,
+    };
+  }
+
+  function inferDateRangePatchPlan(task) {
     const metadata = task.metadata || {};
     if (metadata.fileKind !== 'xlsx') return null;
     const requirement = String(task.requirement || '');
@@ -348,6 +405,7 @@ function createAgentServices({
       questions: [],
       executionMode: 'workbook_patch',
       workbookPatch: {
+        mode: 'date_range_set',
         sheetName,
         headerRowNumber,
         conditionColumn,
@@ -357,6 +415,10 @@ function createAgentServices({
         newValue,
       },
     };
+  }
+
+  function inferWorkbookPatchPlan(task) {
+    return inferTextReplacePatchPlan(task) || inferDateRangePatchPlan(task) || null;
   }
 
   function isCoreAggregateResult(task, toolName, args, toolContent) {
@@ -1028,16 +1090,25 @@ function createAgentServices({
   }
 
   function applyAgentPlan(task, plan) {
-    task.agentPlan = plan;
-    task.agentExplorationSummary = plan.implementation_plan || JSON.stringify(plan);
+    const normalizedPlan = { ...plan };
+    if (normalizedPlan.workbookPatch) {
+      normalizedPlan.workbookPatch = {
+        ...normalizedPlan.workbookPatch,
+        mode: normalizedPlan.workbookPatch.mode
+          || (normalizedPlan.workbookPatch.startDate && normalizedPlan.workbookPatch.endDate ? 'date_range_set' : 'text_replace'),
+      };
+      normalizedPlan.executionMode = normalizedPlan.executionMode || 'workbook_patch';
+    }
+    task.agentPlan = normalizedPlan;
+    task.agentExplorationSummary = normalizedPlan.implementation_plan || JSON.stringify(normalizedPlan);
     task.explorationCheckpoint = null;
     publish(task, 'agent_summary', {
       message: task.agentExplorationSummary || '数据探索完成',
-      plan,
+      plan: normalizedPlan,
       task: publicTask(task),
     });
-    if (plan.status === 'needs_clarification' && Array.isArray(plan.questions) && plan.questions.length) {
-      task.questions = plan.questions;
+    if (normalizedPlan.status === 'needs_clarification' && Array.isArray(normalizedPlan.questions) && normalizedPlan.questions.length) {
+      task.questions = normalizedPlan.questions;
     }
     return task.agentExplorationSummary;
   }
