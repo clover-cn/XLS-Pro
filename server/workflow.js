@@ -80,6 +80,25 @@ function createWorkflow({
     return [domain || 'general'];
   }
 
+  function canonicalSemanticLabel(domain, label, taxonomy) {
+    const text = String(label || '').trim();
+    if (!text) return '';
+    if (taxonomy.includes(text)) return text;
+    if (domain === 'cash_flow') {
+      const aliases = new Map([
+        ['收到其他与经营活动有关的现金', '收到的其他与经营活动有关的现金'],
+        ['支付其他与经营活动有关的现金', '支付的其他与经营活动有关的现金'],
+        ['收到的其他与投资活动有关的现金', '收到其他与投资活动有关的现金'],
+        ['支付的其他与投资活动有关的现金', '支付其他与投资活动有关的现金'],
+        ['收到其他与筹资活动有关的现金', '收到的其他与筹资活动有关的现金'],
+        ['支付其他与筹资活动有关的现金', '支付的其他与筹资活动有关的现金'],
+      ]);
+      const canonical = aliases.get(text);
+      if (canonical && taxonomy.includes(canonical)) return canonical;
+    }
+    return '';
+  }
+
   function semanticKeyAliases(item, subjectColumns) {
     const aliases = new Set();
     if (item?.key) aliases.add(String(item.key));
@@ -289,7 +308,12 @@ with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
     };
     let cacheHits = [];
     try {
-      cacheHits = semanticCache.lookup(cachePayload).hits || [];
+      cacheHits = (semanticCache.lookup(cachePayload).hits || [])
+        .map((item) => ({
+          ...item,
+          label: canonicalSemanticLabel(plan.domain, item.label, plan.taxonomy),
+        }))
+        .filter((item) => item.label);
     } catch (error) {
       log('warn', 'semantic_cache_lookup_failed', {
         taskId: task.id,

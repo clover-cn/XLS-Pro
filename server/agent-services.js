@@ -1466,7 +1466,7 @@ function createAgentServices({
   }
 
   function taxonomyVersionFor(domain, taxonomy) {
-    if (domain === 'cash_flow') return 'cash-flow-v1';
+    if (domain === 'cash_flow') return 'cash-flow-v2';
     if (domain === 'sentiment') return 'sentiment-v1';
     if (domain === 'risk') return 'risk-v1';
     const labels = (Array.isArray(taxonomy) ? taxonomy : [])
@@ -1501,20 +1501,27 @@ function createAgentServices({
       return [
         '销售商品、提供劳务收到的现金',
         '收到的税费返还',
-        '收到其他与经营活动有关的现金',
+        '收到的其他与经营活动有关的现金',
         '购买商品、接受劳务支付的现金',
         '支付给职工以及为职工支付的现金',
         '支付的各项税费',
-        '支付其他与经营活动有关的现金',
+        '支付的其他与经营活动有关的现金',
         '收回投资收到的现金',
         '取得投资收益收到的现金',
         '处置固定资产、无形资产和其他长期资产收回的现金净额',
+        '处置子公司及其他营业单位收到的现金净额',
+        '收到其他与投资活动有关的现金',
         '购建固定资产、无形资产和其他长期资产支付的现金',
         '投资支付的现金',
+        '取得子公司及其他营业单位支付的现金净额',
+        '支付其他与投资活动有关的现金',
+        '吸收投资收到的现金',
         '取得借款收到的现金',
+        '收到的其他与筹资活动有关的现金',
         '偿还债务支付的现金',
         '分配股利、利润或偿付利息支付的现金',
-        '支付其他与筹资活动有关的现金',
+        '支付的其他与筹资活动有关的现金',
+        '汇率变动对现金及现金等价物的影响',
         '未分类',
       ];
     }
