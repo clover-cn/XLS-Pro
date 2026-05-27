@@ -143,7 +143,7 @@ function createRouter({
           if (task.state !== 'cancelled') setTaskState(task, 'cancelled', '任务已手动停止');
           return;
         }
-        log('error', 'metadata_extract_failed', { taskId: task.id, error: error.message });
+        log('error', 'draft_refine_failed', { taskId: task.id, error: error.message });
         setTaskState(task, 'failed', error.message);
       }
     });
@@ -271,6 +271,29 @@ function createRouter({
         const userMessage = { role: 'user', content, at: new Date().toISOString() };
         task.chatMessages.push(userMessage);
         publish(task, 'draft_message', { message: content, role: 'user', task: publicTask(task) });
+        const wantsRevision = Boolean(body.forceRefine || body.revise)
+          || /修改需求|调整需求|重新整理|重新确认|改一下|再改|补充需求/.test(content);
+        if (task.state === 'ready_to_execute' && !wantsRevision) {
+          const reply = '需求已确认，请点击“确认并开始执行”按钮；如需调整需求，请明确说明“修改需求”并补充新的要求。';
+          task.chatMessages.push({
+            role: 'assistant',
+            content: reply,
+            at: new Date().toISOString(),
+            ready: true,
+            openQuestions: [],
+            executionSpec: task.executionSpec,
+          });
+          publish(task, 'draft_message', {
+            message: reply,
+            role: 'assistant',
+            ready: true,
+            openQuestions: [],
+            executionSpec: task.executionSpec,
+            task: publicTask(task),
+          });
+          sendJson(res, 202, publicTask(task));
+          return;
+        }
         if (task.state === 'needs_clarification') {
           task.clarifications.push({ answer: content, at: userMessage.at });
           task.questions = [];
@@ -282,6 +305,11 @@ function createRouter({
         if (!['drafting', 'ready_to_execute', 'metadata_ready'].includes(task.state)) {
           sendJson(res, 409, { error: '当前任务状态不能继续对话', task: publicTask(task) });
           return;
+        }
+        if (wantsRevision) {
+          task.agentPlan = null;
+          task.agentExplorationSummary = '';
+          task.explorationCheckpoint = null;
         }
         task.draftReady = false;
         setTaskState(task, 'drafting', '正在理解需求并准备澄清问题');

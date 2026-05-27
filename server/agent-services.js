@@ -1209,16 +1209,140 @@ function createAgentServices({
     ];
   }
 
-  async function refineTaskDraft(task) {
-    if (!process.env.OPENAI_API_KEY) {
-      throw new Error('缺少 OPENAI_API_KEY，无法进行对话式需求澄清');
+  function latestUserDraftText(task) {
+    const userMessages = (task.chatMessages || [])
+      .filter((message) => message.role === 'user')
+      .map((message) => String(message.content || '').trim())
+      .filter(Boolean);
+    return userMessages.length ? userMessages.join('\n') : String(task.requirement || '').trim();
+  }
+
+  function draftFromAgentPlan(task, plan) {
+    const normalizedPlan = plan || task.agentPlan || {};
+    const finalRequirement = [
+      latestUserDraftText(task),
+      normalizedPlan.implementation_plan ? `执行方案：${normalizedPlan.implementation_plan}` : '',
+    ].filter(Boolean).join('\n');
+    const targetSheets = [];
+    if (normalizedPlan.aggregation?.sheetName) targetSheets.push(normalizedPlan.aggregation.sheetName);
+    if (normalizedPlan.workbookPatch?.sheetName) targetSheets.push(normalizedPlan.workbookPatch.sheetName);
+    const requiredColumns = [
+      ...(normalizedPlan.needed_columns || []),
+      normalizedPlan.workbookPatch?.conditionColumn,
+      normalizedPlan.workbookPatch?.targetColumn,
+      normalizedPlan.aggregation?.column,
+    ].filter(Boolean);
+    return normalizeDraftResponse({
+      reply: '需求已确认，可以开始执行。请点击“确认并开始执行”按钮。',
+      ready: true,
+      openQuestions: [],
+      assumptions: normalizedPlan.evidence?.map((item) => item.finding).filter(Boolean) || [],
+      executionSpec: {
+        finalRequirement,
+        targetSheets: [...new Set(targetSheets)],
+        requiredColumns: [...new Set(requiredColumns)],
+        outputSheets: [],
+        rules: [normalizedPlan.implementation_plan].filter(Boolean),
+        assumptions: normalizedPlan.evidence?.map((item) => item.finding).filter(Boolean) || [],
+      },
+    }, '');
+  }
+
+  function fallbackDraftFromMessages(task, reason) {
+    const finalRequirement = String(task.executionSpec?.finalRequirement || latestUserDraftText(task) || '').trim();
+    const canRun = Boolean(finalRequirement);
+    return normalizeDraftResponse({
+      reply: canRun
+        ? '我已根据当前对话整理出可执行需求。请检查无误后点击“确认并开始执行”；如果还要调整，请继续补充修改点。'
+        : '我还需要你补充想处理的目标、条件或输出格式后才能开始执行。',
+      ready: canRun,
+      openQuestions: canRun ? [] : ['请说明你希望对这个表格做什么，以及期望输出到哪里。'],
+      assumptions: reason ? [reason] : [],
+      executionSpec: {
+        ...(task.executionSpec || {}),
+        finalRequirement,
+      },
+    }, '');
+  }
+
+  function finalizeDraft(task, draft) {
+    if (!Array.isArray(task.chatMessages)) task.chatMessages = [];
+    task.executionSpec = draft.executionSpec;
+    task.draftReady = draft.ready;
+    task.questions = draft.openQuestions;
+    task.chatMessages.push({
+      role: 'assistant',
+      content: draft.reply,
+      at: new Date().toISOString(),
+      ready: draft.ready,
+      openQuestions: draft.openQuestions,
+      executionSpec: draft.executionSpec,
+      assumptions: draft.assumptions,
+    });
+    updateTaskState(task, draft.ready ? 'ready_to_execute' : 'drafting', draft.ready ? '需求已确认，可开始执行' : '等待继续补充需求', {
+      questions: draft.openQuestions,
+    });
+    publish(task, 'draft_message', {
+      message: draft.reply,
+      ready: draft.ready,
+      openQuestions: draft.openQuestions,
+      executionSpec: draft.executionSpec,
+      task: publicTask(task),
+    });
+    return draft;
+  }
+
+  async function requestFinalDraftJson(task, messages, model, reason) {
+    messages.push({
+      role: 'user',
+      content: [
+        reason,
+        '对话澄清阶段已进入收敛阶段。现在禁止继续调用工具。',
+        '请只基于已有文件信息、对话内容和工具结果输出规定 JSON 对象。',
+        '如果仍不确定，请把 ready 设为 false 并提出 1 到 3 个最关键问题；不要输出 Markdown。',
+      ].join('\n'),
+    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const message = await callOpenAiCompatible(messages, 0, {
+        taskId: task.id,
+        phase: 'draft_chat_final',
+        attempt,
+      }, {
+        stream: false,
+        returnMessage: true,
+      });
+      if (!message) continue;
+      const parsed = extractJsonObject(message.content || '');
+      const draft = normalizeDraftResponse(parsed, message.content || '');
+      if (draft.ready || draft.openQuestions.length) return finalizeDraft(task, draft);
+      messages.push({
+        role: 'assistant',
+        content: message.content || '',
+      });
+      messages.push({
+        role: 'user',
+        content: '上一条不是合法需求草稿。请严格只输出 JSON，并且必须包含 ready、reply、openQuestions、executionSpec.finalRequirement。',
+      });
     }
+    return finalizeDraft(task, fallbackDraftFromMessages(task, reason));
+  }
+
+  async function refineTaskDraft(task) {
     assertTaskNotCancelled(task);
     if (!task.metadata) throw new Error('文件元数据尚未解析完成，请稍后再发消息');
     if (!task.retrievedRules || !task.retrievedRules.length) task.retrievedRules = [];
     if (!Array.isArray(task.draftTrace)) task.draftTrace = [];
     const model = process.env.OPENAI_MODEL || 'gpt-4o';
+    const latestRequirement = latestUserDraftText(task);
+    if (latestRequirement) task.requirement = latestRequirement;
+    if (tryPlanFromMetadata(task) && task.agentPlan?.status === 'ready') {
+      return finalizeDraft(task, draftFromAgentPlan(task, task.agentPlan));
+    }
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('缺少 OPENAI_API_KEY，无法进行对话式需求澄清');
+    }
     const messages = buildDraftModelMessages(task);
+    const toolCache = new Map();
     let toolCallCount = 0;
     for (let round = 0; round <= DRAFT_TOOL_ROUND_LIMIT; round += 1) {
       assertTaskNotCancelled(task);
@@ -1244,29 +1368,7 @@ function createAgentServices({
       if (!toolCalls.length) {
         const parsed = extractJsonObject(message.content || '');
         const draft = normalizeDraftResponse(parsed, message.content || '');
-        task.executionSpec = draft.executionSpec;
-        task.draftReady = draft.ready;
-        task.questions = draft.openQuestions;
-        task.chatMessages.push({
-          role: 'assistant',
-          content: draft.reply,
-          at: new Date().toISOString(),
-          ready: draft.ready,
-          openQuestions: draft.openQuestions,
-          executionSpec: draft.executionSpec,
-          assumptions: draft.assumptions,
-        });
-        updateTaskState(task, draft.ready ? 'ready_to_execute' : 'drafting', draft.ready ? '需求已确认，可开始执行' : '等待继续补充需求', {
-          questions: draft.openQuestions,
-        });
-        publish(task, 'draft_message', {
-          message: draft.reply,
-          ready: draft.ready,
-          openQuestions: draft.openQuestions,
-          executionSpec: draft.executionSpec,
-          task: publicTask(task),
-        });
-        return draft;
+        return finalizeDraft(task, draft);
       }
 
       messages.push(toAssistantHistoryMessage(message, model));
@@ -1292,6 +1394,25 @@ function createAgentServices({
             args: traceItem.args,
             task: publicTask(task),
           });
+          const cacheHit = findCachedToolResult(toolCache, toolName, args);
+          if (cacheHit) {
+            const cached = materializeCachedToolResult(cacheHit, toolName, args);
+            toolContent = cached.modelContent;
+            traceItem.result = { ...cached.resultSummary, cacheHit: true };
+            publish(task, 'draft_tool_result', {
+              message: `${toolName} 复用对话澄清工具摘要`,
+              toolName,
+              result: traceItem.result,
+              task: publicTask(task),
+            });
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              name: toolName,
+              content: JSON.stringify(toolContent),
+            });
+            continue;
+          }
           if (toolCallCount >= DRAFT_TOOL_CALL_LIMIT) {
             toolContent = budgetSkippedToolContent(toolName, '对话澄清阶段的只读工具预算已用完', 0);
             traceItem.result = summarizeToolResult(toolContent);
@@ -1314,6 +1435,13 @@ function createAgentServices({
           const resultSummary = summarizeToolResult(result);
           toolContent = compactToolContentForModel(result, toolName);
           traceItem.result = resultSummary;
+          toolCache.set(toolCacheKey(toolName, args), {
+            toolName,
+            normalizedArgs: normalizeToolArgs(toolName, args),
+            rawResult: result,
+            modelContent: toolContent,
+            resultSummary,
+          });
           publish(task, 'draft_tool_result', {
             message: `${toolName} 已返回对话澄清摘要`,
             toolName,
@@ -1339,13 +1467,13 @@ function createAgentServices({
         });
       }
       if (toolCallCount >= DRAFT_TOOL_CALL_LIMIT) {
-        messages.push({
-          role: 'user',
-          content: '对话澄清阶段的只读工具预算已经用完。请基于已有信息输出规定 JSON；如果仍不确定，请提出最关键问题。',
-        });
+        return requestFinalDraftJson(task, messages, model, '对话澄清阶段的只读工具预算已经用完。');
+      }
+      if (round >= DRAFT_TOOL_ROUND_LIMIT) {
+        return requestFinalDraftJson(task, messages, model, '已达到对话澄清工具轮次上限。');
       }
     }
-    throw new Error('模型未能在对话澄清轮次内输出合法需求草稿');
+    return finalizeDraft(task, fallbackDraftFromMessages(task, '已达到对话澄清轮次上限。'));
   }
 
   function applyAgentPlan(task, plan) {
