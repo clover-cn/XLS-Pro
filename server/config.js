@@ -26,10 +26,14 @@ const WORKBOOK_INDEX_TIMEOUT_MS = Number(process.env.WORKBOOK_INDEX_TIMEOUT_MS |
 const TASK_CACHE_TTL_MS = Number(process.env.TASK_CACHE_TTL_MS || 24 * 60 * 60 * 1000);
 const SEMANTIC_BATCH_SIZE = Number(process.env.SEMANTIC_BATCH_SIZE || 120);
 const SEMANTIC_MAX_UNIQUE = Number(process.env.SEMANTIC_MAX_UNIQUE || 2000);
-const TERMINAL_STATES = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
+const DRAFT_TOOL_CALL_LIMIT = Number(process.env.DRAFT_TOOL_CALL_LIMIT || 5);
+const DRAFT_TOOL_ROUND_LIMIT = Number(process.env.DRAFT_TOOL_ROUND_LIMIT || 3);
+const TERMINAL_STATES = new Set(['completed', 'failed', 'needs_clarification', 'ready_to_execute', 'cancelled']);
 const ACTIVE_STATES = new Set([
   'uploaded',
   'metadata_ready',
+  'drafting',
+  'ready_to_execute',
   'indexing',
   'retrieving_rules',
   'exploring_data',
@@ -87,6 +91,8 @@ module.exports = {
   TASK_CACHE_TTL_MS,
   SEMANTIC_BATCH_SIZE,
   SEMANTIC_MAX_UNIQUE,
+  DRAFT_TOOL_CALL_LIMIT,
+  DRAFT_TOOL_ROUND_LIMIT,
   TERMINAL_STATES,
   ACTIVE_STATES,
   loadEnvFile,

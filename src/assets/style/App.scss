@@ -264,6 +264,166 @@ button:disabled {
   align-items: stretch;
 }
 
+.conversation-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+  gap: 18px;
+  align-items: stretch;
+}
+
+.chat-panel,
+.spec-panel {
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-thread {
+  flex: 1;
+  min-height: 260px;
+  max-height: 520px;
+  overflow-y: auto;
+  border: 1px solid #e1e7e3;
+  border-radius: 6px;
+  background: #fbfcfa;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-message {
+  max-width: min(720px, 88%);
+  border: 1px solid #dbe2d9;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #ffffff;
+}
+
+.chat-message.is-user {
+  align-self: flex-end;
+  border-color: #b7d9ca;
+  background: #edf8f2;
+}
+
+.chat-role {
+  display: block;
+  color: #607067;
+  font-size: 12px;
+  font-weight: 800;
+  margin-bottom: 4px;
+}
+
+.chat-message p {
+  margin: 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.question-list {
+  border: 1px solid #e0c56b;
+  border-radius: 6px;
+  background: #fff9e6;
+  color: #6d4f00;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.question-list strong {
+  font-size: 13px;
+}
+
+.question-list span {
+  overflow-wrap: anywhere;
+}
+
+.ready-execute-box {
+  border: 1px solid #b4dcc8;
+  border-radius: 6px;
+  background: #edf8f2;
+  color: #195b3f;
+  padding: 12px;
+  margin-bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ready-execute-box strong {
+  font-size: 14px;
+}
+
+.ready-execute-box span {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.chat-composer {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.chat-composer textarea {
+  width: 100%;
+  border: 1px solid #cbd4ca;
+  border-radius: 6px;
+  padding: 10px 12px;
+  resize: vertical;
+  background: #fbfcfa;
+}
+
+.execution-spec {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.execution-spec p {
+  margin: 0;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.execution-spec dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 8px 10px;
+}
+
+.execution-spec dt {
+  color: #64736a;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.execution-spec dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.spec-panel .primary-button {
+  margin-top: auto;
+  width: 100%;
+}
+
+.draft-log-panel {
+  min-height: 300px;
+}
+
+.draft-log-panel .terminal-window {
+  min-height: 240px;
+}
+
+.draft-log-panel .log-output {
+  min-height: 210px;
+}
+
 .panel-header {
   display: flex;
   align-items: flex-start;
@@ -369,6 +529,7 @@ button:disabled {
 }
 
 .log-state-indexing, .log-state-index_progress, .log-state-index_ready, .log-state-validation, .log-state-classify_progress, .log-state-resume,
+.log-state-draft_message, .log-state-draft_tool_call, .log-state-draft_tool_result,
 .log-state-exploring_data, .log-state-tool_call, .log-state-tool_result, .log-state-agent_summary,
 .log-state-classifying, .log-state-executing, .log-state-generating_code, .log-state-repairing, .log-state-validating_output {
   color: #fde047;
@@ -648,6 +809,7 @@ th {
 @media (max-width: 980px) {
   .workspace,
   .grid,
+  .conversation-layout,
   .console-grid {
     grid-template-columns: 1fr;
   }
@@ -660,6 +822,10 @@ th {
   .status-bar {
     grid-template-columns: 1fr;
     align-items: flex-start;
+  }
+
+  .chat-composer {
+    grid-template-columns: 1fr;
   }
 }
 

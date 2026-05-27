@@ -2,10 +2,10 @@
 
 这个项目把默认 Vue 示例替换为一个本地端到端的 AI 表格处理工作台：
 
-- 前端上传 `.csv` / `.xlsx`，输入核心需求和本次特例规则。
+- 前端上传 `.csv` / `.xlsx`，先通过对话把模糊需求确认成可执行说明。
 - Node BFF 先提取用户指定的前 N 行表头/结构信息、合并单元格、字段类型和总行数，召回本地规则库。
 - Agent 会先为大型 Excel/CSV 构建本地 DuckDB 索引，再通过原生模型 tools 自动查询、搜索、抽样、聚合和读取指定行范围。
-- Agent 在信息不足时进入澄清状态，用户回答后继续探索数据并生成代码。
+- Agent 在确认前只做有限只读探索和追问；用户确认执行后才进入完整探索、生成代码和沙盒执行。
 - Python 沙盒执行生成的 pandas 脚本，只读取当前任务文件并输出 `output.xlsx`。
 
 ## 环境变量
@@ -108,9 +108,10 @@ pnpm run test:excel-tools -- --file input.xlsx
 
 ## API 摘要
 
-- `POST /api/tasks`：multipart 上传文件、需求和临时规则。
+- `POST /api/tasks`：multipart 上传文件、可选初始想法和临时规则，创建对话草稿。
 - `GET /api/tasks/:id/events`：SSE 任务事件流，包含 indexing、index_ready、tool_call、tool_result、agent_summary、validation 等事件。
-- `POST /api/tasks/:id/clarifications`：提交人工澄清回答。
+- `POST /api/tasks/:id/messages`：提交对话消息；草稿阶段用于澄清需求，运行中澄清也走此接口。
+- `POST /api/tasks/:id/execute`：确认当前执行说明并启动处理任务。
 - `GET /api/tasks/:id/code`：查看生成的 Python。
 - `GET /api/tasks/:id/output`：下载结果表。
 - `GET/POST/DELETE /api/rules`：管理本地规则。

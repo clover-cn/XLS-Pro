@@ -17,8 +17,8 @@
           </label>
 
           <label class="field">
-            <span>核心需求</span>
-            <textarea v-model="requirement" name="requirement" rows="6" placeholder="例如：根据这个序时账编制现金流量表，并输出分类汇总。"></textarea>
+            <span>初始想法（可选）</span>
+            <textarea v-model="requirement" name="requirement" rows="5" placeholder="例如：我想把这个序时账整理成现金流量表。也可以先留空，上传后再聊。"></textarea>
           </label>
 
           <label class="field">
@@ -31,8 +31,8 @@
             <input v-model.number="previewRows" name="previewRows" type="number" min="1" max="50" />
           </label>
 
-          <button class="primary-button" type="submit" :disabled="isSubmitting || !selectedFile || !requirement.trim()">
-            {{ isSubmitting ? '创建中' : '创建处理任务' }}
+          <button class="primary-button" type="submit" :disabled="isSubmitting || !selectedFile">
+            {{ isSubmitting ? '创建中' : '上传并开始对话' }}
           </button>
         </form>
 
@@ -66,6 +66,9 @@
             <h2>{{ statusLabel }}</h2>
           </div>
           <div class="status-actions">
+            <button v-if="canExecuteTask" type="button" class="primary-button compact-action" :disabled="isExecuting" @click="executeTask">
+              {{ isExecuting ? '启动中' : '开始执行' }}
+            </button>
             <button v-if="canCancelTask" type="button" class="danger-button" :disabled="isCancelling" @click="cancelTask">
               {{ isCancelling ? '停止中' : '停止任务' }}
             </button>
@@ -78,12 +81,107 @@
         </header>
 
         <section v-if="!task" class="empty-state">
-          <h2>上传表格后开始任务</h2>
-          <p>系统会提取结构信息，再让模型按需搜索和读取局部行，最后生成 pandas 脚本。</p>
+          <h2>上传表格后先对话确认需求</h2>
+          <p>系统会先读取结构信息，再通过对话把模糊需求整理成可执行说明，确认后才开始处理文件。</p>
         </section>
 
         <template v-else>
-          <section class="console-grid">
+          <section v-if="isConversationVisible" class="conversation-layout">
+            <article class="panel chat-panel">
+              <div class="panel-header">
+                <div>
+                  <h3>需求对话</h3>
+                  <p class="muted">先把目标、字段、筛选条件和输出形式确认清楚，再开始执行。</p>
+                </div>
+                <span class="status-pill" :class="`state-${task.state}`">{{ statusLabel }}</span>
+              </div>
+
+              <div class="chat-thread">
+                <div
+                  v-for="(message, index) in task.chatMessages || []"
+                  :key="`${message.at}-${index}`"
+                  :class="['chat-message', `is-${message.role}`]"
+                >
+                  <span class="chat-role">{{ message.role === 'assistant' ? 'Agent' : '你' }}</span>
+                  <p>{{ message.content }}</p>
+                </div>
+                <div v-if="activeQuestions.length" class="question-list">
+                  <strong>需要确认</strong>
+                  <span v-for="question in activeQuestions" :key="question">{{ question }}</span>
+                </div>
+              </div>
+
+              <form class="chat-composer" @submit.prevent="sendDraftMessage">
+                <textarea
+                  v-model="draftMessage"
+                  rows="4"
+                  :placeholder="task.state === 'needs_clarification' ? '回答上面的问题，任务会继续执行。' : '描述你想得到的结果，或补充筛选条件、字段含义、输出格式。'"
+                  :disabled="isSendingMessage || isExecuting"
+                ></textarea>
+                <button class="primary-button" type="submit" :disabled="isSendingMessage || !draftMessage.trim()">
+                  {{ isSendingMessage ? '发送中' : '发送' }}
+                </button>
+              </form>
+            </article>
+
+            <article class="panel spec-panel">
+              <h3>待执行说明</h3>
+              <div v-if="task.state === 'ready_to_execute'" class="ready-execute-box">
+                <strong>需求已确认</strong>
+                <span>系统不会自动执行。请检查下方说明，确认无误后点击“确认并开始执行”。</span>
+              </div>
+              <div v-if="task.executionSpec?.finalRequirement" class="execution-spec">
+                <span class="eyebrow">确认后的需求</span>
+                <p>{{ task.executionSpec.finalRequirement }}</p>
+                <dl>
+                  <template v-if="specList('targetSheets').length">
+                    <dt>目标工作表</dt>
+                    <dd>{{ specList('targetSheets').join('，') }}</dd>
+                  </template>
+                  <template v-if="specList('requiredColumns').length">
+                    <dt>关键字段</dt>
+                    <dd>{{ specList('requiredColumns').join('，') }}</dd>
+                  </template>
+                  <template v-if="specList('outputSheets').length">
+                    <dt>输出结果</dt>
+                    <dd>{{ specList('outputSheets').join('，') }}</dd>
+                  </template>
+                  <template v-if="specList('rules').length">
+                    <dt>业务规则</dt>
+                    <dd>{{ specList('rules').join('；') }}</dd>
+                  </template>
+                </dl>
+              </div>
+              <p v-else class="muted">对话完成后会在这里生成一份可执行说明。</p>
+              <button class="primary-button" type="button" :disabled="!canExecuteTask || isExecuting" @click="executeTask">
+                {{ isExecuting ? '启动中' : '确认并开始执行' }}
+              </button>
+            </article>
+          </section>
+
+          <section v-if="isConversationVisible" class="panel draft-log-panel">
+            <div class="panel-header">
+              <div>
+                <h3>实时日志</h3>
+                <p class="muted">对话澄清、只读索引和工具调用会显示在这里，长时间处理时可以看到当前进度。</p>
+              </div>
+              <button type="button" @click="fetchTaskLogs">刷新</button>
+            </div>
+            <div class="terminal-window">
+              <div class="log-output" ref="logContainer">
+                <div v-for="(line, index) in parsedLogLines" :key="index" :class="['log-line', `log-state-${line.state}`]">
+                  <template v-if="!line.raw && line.time">
+                    <span class="log-time">[{{ line.time }}]</span>
+                    <span class="log-arrow">></span>
+                  </template>
+                  <span class="log-text">{{ line.text }}</span>
+                </div>
+                <div><span class="cursor-blink-inline"></span></div>
+              </div>
+            </div>
+          </section>
+
+          <section v-if="!isDraftOnlyPhase && !isConversationVisible" class="console-grid">
             <article class="panel log-panel">
               <div class="panel-header">
                 <div>
@@ -224,28 +322,8 @@
       </section>
     </section>
 
-    <div v-if="task?.state === 'needs_clarification' && !clarificationDismissed" class="dialog-backdrop">
-      <section class="dialog">
-        <h2>需要人工确认</h2>
-        <p class="muted">Agent 需要你补充以下信息后才会继续生成代码。</p>
-        <ul v-if="clarificationQuestions.length">
-          <li v-for="question in clarificationQuestions" :key="question">{{ question }}</li>
-        </ul>
-        <div v-else class="error-box">
-          未收到具体问题。请查看实时日志，或取消后重新创建任务。
-        </div>
-        <textarea v-model="clarificationAnswer" name="clarificationAnswer" rows="5" placeholder="请逐条回答上面的问题。"></textarea>
-        <div class="dialog-actions">
-          <button type="button" @click="cancelClarification">取消</button>
-          <button class="primary-button" type="button" :disabled="!clarificationAnswer.trim()" @click="submitClarification">
-            提交并继续
-          </button>
-        </div>
-      </section>
-    </div>
-
     <!-- 悬浮 Agent 追踪球 -->
-    <div class="floating-agent-trigger" v-if="task && task.agentTrace && task.agentTrace.length > 0" :class="{ 'is-tracing': isAgentTracing }" @click="showTracePanel = true" title="查看 Agent 工具调用">
+    <div class="floating-agent-trigger" v-if="combinedAgentTrace.length > 0" :class="{ 'is-tracing': isAgentTracing }" @click="showTracePanel = true" title="查看 Agent 工具调用">
       <svg v-if="isAgentTracing" class="spinner-svg trigger-icon" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>
       <svg v-else class="trigger-icon" viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
       <span v-if="isAgentTracing" class="float-pulse"></span>
@@ -257,7 +335,7 @@
         <div class="trace-drawer-header">
           <div>
             <h3>Agent 思考与工具调用</h3>
-            <span class="trace-count-badge">共 {{ task?.agentTrace?.length || 0 }} 步</span>
+            <span class="trace-count-badge">共 {{ combinedAgentTrace.length }} 步</span>
           </div>
           <button type="button" class="icon-button close-drawer" @click="showTracePanel = false" title="关闭">
             <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
@@ -265,7 +343,7 @@
         </div>
         <div class="trace-drawer-content">
           <div class="agent-traces-list">
-            <details v-for="(trace, index) in task?.agentTrace" :key="index" class="trace-details-box" :open="!trace.result || index === task?.agentTrace?.length! - 1">
+            <details v-for="(trace, index) in combinedAgentTrace" :key="`${trace.phase || 'run'}-${index}`" class="trace-details-box" :open="!trace.result || index === combinedAgentTrace.length - 1">
               <summary>
                 <div class="summary-left">
                   <span class="status-icon" :class="{ 'is-running': !trace.result, 'is-done': trace.result }">
@@ -273,7 +351,7 @@
                     <svg v-else viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round" class="spinner-svg"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line><line x1="2" y1="12" x2="6" y2="12"></line><line x1="18" y1="12" x2="22" y2="12"></line><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line></svg>
                   </span>
                   <span class="summary-copy">
-                    <span class="tool-name">{{ trace.toolName }}</span>
+                    <span class="tool-name">{{ trace.phase === 'draft' ? '澄清' : '执行' }} / {{ trace.toolName }}</span>
                     <span class="tool-reason">{{ formatTraceReason(trace) }}</span>
                   </span>
                 </div>
@@ -337,11 +415,33 @@ type AgentTrace = {
   args: Record<string, unknown>;
   result?: Record<string, unknown>;
   at: string;
+  phase?: 'draft' | 'run';
+};
+
+type ChatMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  at: string;
+  ready?: boolean;
+  openQuestions?: string[];
+  executionSpec?: ExecutionSpec;
+  assumptions?: string[];
+};
+
+type ExecutionSpec = {
+  finalRequirement?: string;
+  targetSheets?: string[];
+  requiredColumns?: string[];
+  outputSheets?: string[];
+  rules?: string[];
+  assumptions?: string[];
+  [key: string]: unknown;
 };
 
 type Task = {
   id: string;
   filename: string;
+  originalRequirement?: string;
   fileHash?: string;
   requirement: string;
   temporaryRules: string;
@@ -349,6 +449,10 @@ type Task = {
   metadata: MetadataSummary | null;
   retrievedRules: KnowledgeRule[];
   clarifications: { answer: string; at: string }[];
+  chatMessages: ChatMessage[];
+  executionSpec: ExecutionSpec | null;
+  draftTrace?: AgentTrace[];
+  draftReady?: boolean;
   generatedCode: string;
   state: string;
   message: string;
@@ -387,6 +491,10 @@ type AgentEvent = {
   profile?: Record<string, unknown>;
   plan?: Record<string, unknown>;
   report?: Record<string, unknown>;
+  role?: 'user' | 'assistant';
+  ready?: boolean;
+  openQuestions?: string[];
+  executionSpec?: ExecutionSpec;
   indexedRows?: number;
   totalRows?: number | null;
   percent?: number | null;
@@ -398,7 +506,7 @@ const selectedFile = ref<File | null>(null);
 const requirement = ref('');
 const temporaryRules = ref('');
 const previewRows = ref(3);
-const clarificationAnswer = ref('');
+const draftMessage = ref('');
 const rules = ref<KnowledgeRule[]>([]);
 const newRule = ref({ condition: '', action: '' });
 const task = ref<Task | null>(null);
@@ -407,15 +515,21 @@ const logText = ref('');
 const isSubmitting = ref(false);
 const isCancelling = ref(false);
 const isRetrying = ref(false);
+const isSendingMessage = ref(false);
+const isExecuting = ref(false);
 const eventSource = ref<EventSource | null>(null);
 const currentQuestions = ref<string[]>([]);
-const clarificationDismissed = ref(false);
 const taskPollingTimer = ref<number | null>(null);
 const logPollingTimer = ref<number | null>(null);
 
 const showTracePanel = ref(false);
+const combinedAgentTrace = computed<AgentTrace[]>(() => {
+  const draftTrace = (task.value?.draftTrace || []).map((trace) => ({ ...trace, phase: 'draft' as const }));
+  const runTrace = (task.value?.agentTrace || []).map((trace) => ({ ...trace, phase: 'run' as const }));
+  return [...draftTrace, ...runTrace];
+});
 const isAgentTracing = computed(() => {
-  const trace = task.value?.agentTrace;
+  const trace = combinedAgentTrace.value;
   if (!trace || trace.length === 0) return false;
   return !trace[trace.length - 1].result;
 });
@@ -473,6 +587,8 @@ watch(parsedLogLines, async () => {
 const statusText: Record<string, string> = {
   uploaded: '文件已上传',
   metadata_ready: '元数据已解析',
+  drafting: '正在确认需求',
+  ready_to_execute: '等待确认执行',
   indexing: '正在构建索引',
   retrieving_rules: '正在召回规则',
   exploring_data: '正在探索表格',
@@ -494,14 +610,21 @@ const statusLabel = computed(() => {
 
 const downloadUrl = computed(() => (task.value ? `/api/tasks/${task.value.id}/output` : '#'));
 
-const terminalStates = new Set(['completed', 'failed', 'needs_clarification', 'cancelled']);
-const cancellableStates = new Set(['uploaded', 'metadata_ready', 'indexing', 'retrieving_rules', 'exploring_data', 'classifying', 'generating_code', 'executing', 'repairing', 'validating_output', 'needs_clarification']);
+const terminalStates = new Set(['completed', 'failed', 'ready_to_execute', 'needs_clarification', 'cancelled']);
+const draftOnlyStates = new Set(['uploaded', 'metadata_ready', 'drafting', 'ready_to_execute']);
+const conversationStates = new Set(['uploaded', 'metadata_ready', 'drafting', 'ready_to_execute', 'needs_clarification']);
+const cancellableStates = new Set(['uploaded', 'metadata_ready', 'drafting', 'ready_to_execute', 'indexing', 'retrieving_rules', 'exploring_data', 'classifying', 'generating_code', 'executing', 'repairing', 'validating_output', 'needs_clarification']);
 
 const canCancelTask = computed(() => Boolean(task.value && cancellableStates.has(task.value.state)));
 const canRetryTask = computed(() => Boolean(task.value && task.value.state === 'failed' && !task.value.retrying));
+const canExecuteTask = computed(() => Boolean(task.value && task.value.state === 'ready_to_execute' && task.value.executionSpec?.finalRequirement));
+const isConversationVisible = computed(() => Boolean(task.value && conversationStates.has(task.value.state)));
+const isDraftOnlyPhase = computed(() => Boolean(task.value && draftOnlyStates.has(task.value.state)));
 
 const executionMessage = computed(() => {
   if (!task.value) return '等待创建任务';
+  if (task.value.state === 'drafting') return '正在通过对话确认任务目标和输出要求。';
+  if (task.value.state === 'ready_to_execute') return '需求已整理完成，确认后开始执行。';
   if (task.value.state === 'indexing') return '正在为大型表格构建本地查询索引。';
   if (task.value.state === 'exploring_data') return '模型正在调用工具搜索表格并读取指定行。';
   if (task.value.state === 'classifying') return '正在对唯一值组合做语义分类。';
@@ -516,11 +639,16 @@ const executionMessage = computed(() => {
   return task.value.message || '任务处理中';
 });
 
-const clarificationQuestions = computed(() => {
+const activeQuestions = computed(() => {
   const fromTask = task.value?.questions || [];
   if (fromTask.length) return fromTask;
   return currentQuestions.value;
 });
+
+function specList(key: keyof ExecutionSpec) {
+  const value = task.value?.executionSpec?.[key];
+  return Array.isArray(value) ? value.map((item) => String(item || '').trim()).filter(Boolean) : [];
+}
 
 const rawColumnIndexes = computed(() => {
   const rows = task.value?.metadata?.rawRows || [];
@@ -622,7 +750,6 @@ function connectEvents(id: string) {
     events.value.unshift(event);
     if (event.task) task.value = event.task;
     if (event.task?.questions?.length) currentQuestions.value = event.task.questions;
-    if (event.state !== 'needs_clarification') clarificationDismissed.value = false;
     if (event.state === 'completed' || event.state === 'failed' || event.state === 'cancelled') {
       refreshTask(id);
     }
@@ -643,11 +770,12 @@ function connectEvents(id: string) {
     fetchTaskLogs();
   });
 
-  ['indexing', 'index_progress', 'index_ready', 'tool_call', 'tool_result', 'tool_budget_extended', 'agent_summary', 'classify_progress', 'validation', 'resume'].forEach((eventName) => {
+  ['indexing', 'index_progress', 'index_ready', 'draft_message', 'draft_tool_call', 'draft_tool_result', 'tool_call', 'tool_result', 'tool_budget_extended', 'agent_summary', 'classify_progress', 'validation', 'resume'].forEach((eventName) => {
     source.addEventListener(eventName, (message) => {
       const event = JSON.parse((message as MessageEvent).data) as AgentEvent;
       events.value.unshift(event);
       if (event.task) task.value = event.task;
+      if (event.openQuestions?.length) currentQuestions.value = event.openQuestions;
       fetchTaskLogs();
     });
   });
@@ -681,7 +809,7 @@ async function createTask() {
     }
     task.value = await response.json();
     currentQuestions.value = [];
-    clarificationDismissed.value = false;
+    draftMessage.value = '';
     logText.value = '';
     if (task.value) {
       connectEvents(task.value.id);
@@ -737,28 +865,51 @@ async function cancelTask() {
   }
 }
 
-async function submitClarification() {
-  if (!task.value) return;
-  const response = await fetch(`/api/tasks/${task.value.id}/clarifications`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ answer: clarificationAnswer.value }),
-  });
-  if (response.ok) {
-    task.value = await response.json();
-    clarificationAnswer.value = '';
-    currentQuestions.value = [];
-    clarificationDismissed.value = false;
-    if (task.value) {
-      startPolling(task.value.id);
+async function sendDraftMessage() {
+  if (!task.value || !draftMessage.value.trim() || isSendingMessage.value) return;
+  isSendingMessage.value = true;
+  try {
+    const response = await fetch(`/api/tasks/${task.value.id}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: draftMessage.value }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || '消息发送失败');
     }
+    task.value = payload;
+    draftMessage.value = '';
+    currentQuestions.value = payload.questions || [];
+    if (task.value) startPolling(task.value.id);
     fetchTaskLogs();
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '消息发送失败');
+  } finally {
+    isSendingMessage.value = false;
   }
 }
 
-function cancelClarification() {
-  clarificationDismissed.value = true;
-  clarificationAnswer.value = '';
+async function executeTask() {
+  if (!task.value || isExecuting.value) return;
+  isExecuting.value = true;
+  try {
+    const response = await fetch(`/api/tasks/${task.value.id}/execute`, { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || '启动执行失败');
+    }
+    task.value = payload;
+    if (task.value) {
+      connectEvents(task.value.id);
+      startPolling(task.value.id);
+    }
+    fetchTaskLogs();
+  } catch (error) {
+    alert(error instanceof Error ? error.message : '启动执行失败');
+  } finally {
+    isExecuting.value = false;
+  }
 }
 
 function formatTime(value: string) {

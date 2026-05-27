@@ -18,6 +18,7 @@ function createRouter({
   isCancelledError,
   touchIfExists,
   extractMetadata,
+  refineTaskDraft,
   executeWorkflow,
 }) {
   async function createTask(req, res) {
@@ -37,7 +38,6 @@ function createRouter({
     const temporaryRules = (parts.find((part) => part.name === 'temporaryRules')?.content.toString('utf8') || '').trim();
     const previewRowsRaw = Number((parts.find((part) => part.name === 'previewRows')?.content.toString('utf8') || '3').trim());
     const previewRows = Math.max(1, Math.min(Number.isFinite(previewRowsRaw) ? previewRowsRaw : 3, 50));
-    if (!requirement) throw new Error('请输入处理需求');
   
     const id = crypto.randomUUID();
     const dir = path.join(TASKS_DIR, id);
@@ -75,12 +75,17 @@ function createRouter({
       fileHash,
       fileCacheDir,
       filename,
+      originalRequirement: requirement,
       requirement,
       temporaryRules,
       previewRows,
       metadata: null,
       retrievedRules: [],
       clarifications: [],
+      chatMessages: [],
+      executionSpec: null,
+      draftTrace: [],
+      draftReady: false,
       failedStage: '',
       lastError: '',
       retryCount: 0,
@@ -122,7 +127,17 @@ function createRouter({
           previewRows: task.metadata.previewRows,
         });
         setTaskState(task, 'metadata_ready', '元数据解析完成');
-        executeWorkflow(task);
+        if (requirement) {
+          task.chatMessages.push({ role: 'user', content: requirement, at: new Date().toISOString() });
+          publish(task, 'draft_message', { message: requirement, role: 'user', task: publicTask(task) });
+          setTaskState(task, 'drafting', '正在理解需求并准备澄清问题');
+          await refineTaskDraft(task);
+        } else {
+          const greeting = '文件结构已读取。请告诉我你希望对这个表格做什么，我会先确认需求再开始执行。';
+          task.chatMessages.push({ role: 'assistant', content: greeting, at: new Date().toISOString(), ready: false });
+          setTaskState(task, 'drafting', '等待输入处理需求');
+          publish(task, 'draft_message', { message: greeting, role: 'assistant', ready: false, task: publicTask(task) });
+        }
       } catch (error) {
         if (isCancelledError(error) || task.cancelRequested) {
           if (task.state !== 'cancelled') setTaskState(task, 'cancelled', '任务已手动停止');
@@ -247,13 +262,64 @@ function createRouter({
         setImmediate(() => executeWorkflow(task));
         return;
       }
-      if (action === 'clarifications' && req.method === 'POST') {
+      if (action === 'messages' && req.method === 'POST') {
         assertTaskNotCancelled(task);
         const body = await parseJsonBody(req);
-        task.clarifications.push({ answer: String(body.answer || '').trim(), at: new Date().toISOString() });
-        publish(task, 'clarification', { answer: body.answer });
-        executeWorkflow(task);
+        const content = String(body.message || body.answer || '').trim();
+        if (!content) throw new Error('消息不能为空');
+        if (!Array.isArray(task.chatMessages)) task.chatMessages = [];
+        const userMessage = { role: 'user', content, at: new Date().toISOString() };
+        task.chatMessages.push(userMessage);
+        publish(task, 'draft_message', { message: content, role: 'user', task: publicTask(task) });
+        if (task.state === 'needs_clarification') {
+          task.clarifications.push({ answer: content, at: userMessage.at });
+          task.questions = [];
+          publish(task, 'clarification', { answer: content, task: publicTask(task) });
+          sendJson(res, 202, publicTask(task));
+          setImmediate(() => executeWorkflow(task));
+          return;
+        }
+        if (!['drafting', 'ready_to_execute', 'metadata_ready'].includes(task.state)) {
+          sendJson(res, 409, { error: '当前任务状态不能继续对话', task: publicTask(task) });
+          return;
+        }
+        task.draftReady = false;
+        setTaskState(task, 'drafting', '正在理解需求并准备澄清问题');
         sendJson(res, 202, publicTask(task));
+        setImmediate(async () => {
+          try {
+            await refineTaskDraft(task);
+          } catch (error) {
+            if (isCancelledError(error) || task.cancelRequested) {
+              if (task.state !== 'cancelled') setTaskState(task, 'cancelled', '任务已手动停止');
+              return;
+            }
+            log('error', 'draft_refine_failed', { taskId: task.id, error: error.message });
+            setTaskState(task, 'failed', error.message || '需求澄清失败');
+          }
+        });
+        return;
+      }
+      if (action === 'execute' && req.method === 'POST') {
+        if (task.state !== 'ready_to_execute' || !task.executionSpec?.finalRequirement) {
+          sendJson(res, 409, { error: '需求尚未确认，不能开始执行', task: publicTask(task) });
+          return;
+        }
+        task.requirement = String(task.executionSpec.finalRequirement || '').trim();
+        task.clarifications = (task.chatMessages || [])
+          .filter((message) => message.role === 'user')
+          .map((message) => ({ answer: message.content, at: message.at }));
+        task.questions = [];
+        task.draftReady = true;
+        task.cancelRequested = false;
+        task.abortController = null;
+        publish(task, 'resume', {
+          message: '已确认需求，开始执行任务',
+          executionSpec: task.executionSpec,
+          task: publicTask(task),
+        });
+        sendJson(res, 202, publicTask(task));
+        setImmediate(() => executeWorkflow(task));
         return;
       }
       if (action === 'code' && req.method === 'GET') {

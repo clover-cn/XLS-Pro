@@ -23,6 +23,7 @@ const agentServices = createAgentServices({
   log,
   publish: taskState.publish,
   publicTask: taskState.publicTask,
+  setTaskState: taskState.setTaskState,
   assertTaskNotCancelled: taskState.assertTaskNotCancelled,
   cancelledError: taskState.cancelledError,
   trackChildProcess: taskState.trackChildProcess,
@@ -65,6 +66,7 @@ const route = createRouter({
   isCancelledError: taskState.isCancelledError,
   touchIfExists: cache.touchIfExists,
   extractMetadata,
+  refineTaskDraft: agentServices.refineTaskDraft,
   executeWorkflow: workflow.executeWorkflow,
 });
 

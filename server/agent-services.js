@@ -4,8 +4,11 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const {
   TASK_DIR,
+  WORKBOOK_INDEX_VERSION,
   WORKBOOK_INDEX_TIMEOUT_MS,
   EXCEL_TOOL_TIMEOUT_MS,
+  DRAFT_TOOL_CALL_LIMIT,
+  DRAFT_TOOL_ROUND_LIMIT,
   AGENT_TOOL_CALL_LIMIT,
   AGENT_TOOL_CALLS_PER_ROUND,
   AGENT_FORCE_FINAL_REMAINING,
@@ -25,11 +28,23 @@ function createAgentServices({
   log,
   publish,
   publicTask,
+  setTaskState,
   assertTaskNotCancelled,
   cancelledError,
   trackChildProcess,
   isPathInside,
 }) {
+  function updateTaskState(task, state, message, extra = {}) {
+    if (setTaskState) {
+      setTaskState(task, state, message, extra);
+      return;
+    }
+    task.state = state;
+    task.message = message || task.message;
+    task.updatedAt = new Date().toISOString();
+    Object.assign(task, extra);
+  }
+
   function stableStringify(value) {
     if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
     if (value && typeof value === 'object') {
@@ -1089,6 +1104,250 @@ function createAgentServices({
     });
   }
 
+  async function ensureWorkbookIndexReady(task) {
+    if (task.indexStatus === 'ready' && task.workbookProfile) return;
+    const indexDir = task.indexDir || path.join(task.dir, 'index');
+    const manifestPath = path.join(indexDir, 'manifest.json');
+    if (fs.existsSync(manifestPath)) {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest.version === WORKBOOK_INDEX_VERSION) {
+        task.workbookProfile = manifest;
+        task.indexStatus = 'ready';
+        task.indexReused = true;
+        publish(task, 'index_ready', {
+          message: '复用已有 DuckDB 表格索引',
+          profile: summarizeToolResult({ sheets: manifest.sheets || [] }),
+          task: publicTask(task),
+        });
+        return;
+      }
+    }
+    task.indexStatus = 'indexing';
+    publish(task, 'indexing', { message: '正在为对话澄清构建只读表格索引', task: publicTask(task) });
+    const indexed = await buildWorkbookIndex(task);
+    task.indexDir = indexed.indexDir;
+    task.workbookProfile = indexed.manifest;
+    task.indexStatus = 'ready';
+    task.indexReused = false;
+    publish(task, 'index_ready', {
+      message: '对话澄清可用的表格索引构建完成',
+      profile: summarizeToolResult({ sheets: indexed.manifest.sheets || [] }),
+      task: publicTask(task),
+    });
+  }
+
+  function normalizeDraftResponse(parsed, fallbackReply) {
+    const response = parsed && typeof parsed === 'object' ? parsed : {};
+    const executionSpec = response.executionSpec && typeof response.executionSpec === 'object'
+      ? response.executionSpec
+      : {};
+    const finalRequirement = String(
+      executionSpec.finalRequirement
+        || response.finalRequirement
+        || response.requirement
+        || '',
+    ).trim();
+    return {
+      reply: String(response.reply || fallbackReply || '').trim()
+        || '我还需要你补充目标结果、筛选条件或输出格式后才能开始执行。',
+      ready: Boolean(response.ready && finalRequirement),
+      openQuestions: Array.isArray(response.openQuestions)
+        ? response.openQuestions.map((item) => String(item || '').trim()).filter(Boolean)
+        : [],
+      assumptions: Array.isArray(response.assumptions)
+        ? response.assumptions.map((item) => String(item || '').trim()).filter(Boolean)
+        : [],
+      executionSpec: {
+        ...executionSpec,
+        finalRequirement,
+      },
+    };
+  }
+
+  function buildDraftModelMessages(task) {
+    const systemPrompt = [
+      '你是一个面向普通 C 端用户的 Excel 任务澄清 Agent。',
+      '你的目标不是执行任务，而是通过自然对话把模糊需求整理成可执行说明。',
+      '你可以少量调用只读 Excel 工具确认工作表、表头、样例行或关键词位置；禁止生成代码，禁止承诺已经完成处理。',
+      `本轮对话最多使用 ${DRAFT_TOOL_CALL_LIMIT} 次只读工具；如果仅凭元数据已经能提问，就不要调用工具。`,
+      '当需求仍不明确时，提出 1 到 3 个最关键的问题，不要一次问太多。',
+      '当需求已经足够执行时，给出简短确认说明，并把 ready 设为 true。',
+      '整个回复必须只输出 JSON 对象，不要 Markdown。',
+      'JSON 格式：{"reply":"给用户看的自然语言回复","ready":true|false,"openQuestions":["待用户回答的问题"],"assumptions":["默认假设"],"executionSpec":{"finalRequirement":"确认后的完整执行需求","targetSheets":["工作表"],"requiredColumns":["列名"],"outputSheets":["输出表"],"rules":["业务规则"],"assumptions":["执行假设"]}}',
+    ].join('\n');
+    const context = [
+      '【文件信息】',
+      JSON.stringify({
+        filename: task.filename,
+        metadata: task.metadata,
+        workbookProfile: task.workbookProfile
+          ? { sheets: (task.workbookProfile.sheets || []).map((sheet) => ({
+            sheetName: sheet.sheetName,
+            totalRows: sheet.totalRows,
+            totalColumns: sheet.totalColumns,
+            detectedHeaderRowNumber: sheet.detectedHeaderRowNumber,
+          })) }
+          : null,
+      }),
+      '',
+      '【长期规则命中】',
+      JSON.stringify(task.retrievedRules || []),
+      '',
+      '【本次特例规则】',
+      task.temporaryRules || '无',
+      '',
+      '【当前执行说明草稿】',
+      JSON.stringify(task.executionSpec || {}),
+    ].join('\n');
+    return [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: context },
+      ...(task.chatMessages || []).map((message) => ({
+        role: message.role === 'assistant' ? 'assistant' : 'user',
+        content: String(message.content || ''),
+      })),
+    ];
+  }
+
+  async function refineTaskDraft(task) {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('缺少 OPENAI_API_KEY，无法进行对话式需求澄清');
+    }
+    assertTaskNotCancelled(task);
+    if (!task.metadata) throw new Error('文件元数据尚未解析完成，请稍后再发消息');
+    if (!task.retrievedRules || !task.retrievedRules.length) task.retrievedRules = [];
+    if (!Array.isArray(task.draftTrace)) task.draftTrace = [];
+    const model = process.env.OPENAI_MODEL || 'gpt-4o';
+    const messages = buildDraftModelMessages(task);
+    let toolCallCount = 0;
+    for (let round = 0; round <= DRAFT_TOOL_ROUND_LIMIT; round += 1) {
+      assertTaskNotCancelled(task);
+      const message = await callOpenAiCompatible(messages, 0, {
+        taskId: task.id,
+        phase: 'draft_chat',
+        round,
+      }, {
+        stream: false,
+        tools: EXCEL_AGENT_TOOLS,
+        toolChoice: 'auto',
+        returnMessage: true,
+      });
+      if (!message) throw new Error('模型未返回对话澄清结果');
+      let toolCalls = message.tool_calls || [];
+      if (!toolCalls.length) {
+        toolCalls = parseDsmlToolCalls(message.content || '');
+        if (toolCalls.length) {
+          message.tool_calls = toolCalls;
+          message.content = '';
+        }
+      }
+      if (!toolCalls.length) {
+        const parsed = extractJsonObject(message.content || '');
+        const draft = normalizeDraftResponse(parsed, message.content || '');
+        task.executionSpec = draft.executionSpec;
+        task.draftReady = draft.ready;
+        task.questions = draft.openQuestions;
+        task.chatMessages.push({
+          role: 'assistant',
+          content: draft.reply,
+          at: new Date().toISOString(),
+          ready: draft.ready,
+          openQuestions: draft.openQuestions,
+          executionSpec: draft.executionSpec,
+          assumptions: draft.assumptions,
+        });
+        updateTaskState(task, draft.ready ? 'ready_to_execute' : 'drafting', draft.ready ? '需求已确认，可开始执行' : '等待继续补充需求', {
+          questions: draft.openQuestions,
+        });
+        publish(task, 'draft_message', {
+          message: draft.reply,
+          ready: draft.ready,
+          openQuestions: draft.openQuestions,
+          executionSpec: draft.executionSpec,
+          task: publicTask(task),
+        });
+        return draft;
+      }
+
+      messages.push(toAssistantHistoryMessage(message, model));
+      await ensureWorkbookIndexReady(task);
+      for (const toolCall of toolCalls) {
+        const toolName = toolCall.function?.name || '';
+        let rawArgs = {};
+        let args = {};
+        let reason = traceToolReason(toolName, {});
+        let toolContent;
+        const traceItem = { toolName, reason, args: {}, at: new Date().toISOString() };
+        try {
+          rawArgs = parseToolArguments(toolCall.function?.arguments || '{}');
+          args = stripToolTraceOnlyArgs(rawArgs);
+          reason = traceToolReason(toolName, rawArgs);
+          traceItem.reason = reason;
+          traceItem.args = summarizeToolArgs(args);
+          task.draftTrace.push(traceItem);
+          publish(task, 'draft_tool_call', {
+            message: `对话澄清调用 ${toolName}：${reason}`,
+            toolName,
+            reason,
+            args: traceItem.args,
+            task: publicTask(task),
+          });
+          if (toolCallCount >= DRAFT_TOOL_CALL_LIMIT) {
+            toolContent = budgetSkippedToolContent(toolName, '对话澄清阶段的只读工具预算已用完', 0);
+            traceItem.result = summarizeToolResult(toolContent);
+            publish(task, 'draft_tool_result', {
+              message: `${toolName} 已跳过：对话澄清工具预算已用完`,
+              toolName,
+              result: traceItem.result,
+              task: publicTask(task),
+            });
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              name: toolName,
+              content: JSON.stringify(toolContent),
+            });
+            continue;
+          }
+          toolCallCount += 1;
+          const result = await runExcelTool(task, toolName, args);
+          const resultSummary = summarizeToolResult(result);
+          toolContent = compactToolContentForModel(result, toolName);
+          traceItem.result = resultSummary;
+          publish(task, 'draft_tool_result', {
+            message: `${toolName} 已返回对话澄清摘要`,
+            toolName,
+            result: resultSummary,
+            task: publicTask(task),
+          });
+        } catch (error) {
+          toolContent = toolErrorData(error, toolName);
+          traceItem.result = summarizeToolResult(toolContent);
+          if (!task.draftTrace.includes(traceItem)) task.draftTrace.push(traceItem);
+          publish(task, 'draft_tool_result', {
+            message: `${toolName} 对话澄清调用失败：${toolContent.error}`,
+            toolName,
+            result: toolContent,
+            task: publicTask(task),
+          });
+        }
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          name: toolName,
+          content: JSON.stringify(toolContent),
+        });
+      }
+      if (toolCallCount >= DRAFT_TOOL_CALL_LIMIT) {
+        messages.push({
+          role: 'user',
+          content: '对话澄清阶段的只读工具预算已经用完。请基于已有信息输出规定 JSON；如果仍不确定，请提出最关键问题。',
+        });
+      }
+    }
+    throw new Error('模型未能在对话澄清轮次内输出合法需求草稿');
+  }
+
   function applyAgentPlan(task, plan) {
     const normalizedPlan = { ...plan };
     if (normalizedPlan.workbookPatch) {
@@ -1890,6 +2149,7 @@ function createAgentServices({
     extractCodeBlock,
     buildWorkbookIndex,
     runExcelTool,
+    refineTaskDraft,
     tryPlanFromMetadata,
     exploreDataWithTools,
     routeTaskIntent,
